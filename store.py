@@ -1,0 +1,180 @@
+"""SQLite cache of raw market data — the ``md_*`` tables (see ``schema.sql``).
+
+Plain functions over a caller-supplied connection: this module never opens one, so it
+works the same whether the database is the package's own or the host's. The adapter is
+the only caller and opens a short-lived connection per request (SQLite connect is
+sub-millisecond). All figures are stored already-normalized (full VND; index unscaled)
+— scaling is the source's job, so the store never has to know who answered.
+"""
+import json
+from datetime import datetime, timezone
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _age_seconds(ts: str) -> float | None:
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+# ── fetch-freshness markers (md_fetch_meta) ─────────────────────────────────
+def meta_fresh(conn, symbol: str, kind: str, ttl_seconds: float) -> bool:
+    """True if (symbol, kind) was fetched within the TTL — serve store, skip the source."""
+    row = conn.execute(
+        "SELECT fetched_at FROM md_fetch_meta WHERE symbol=? AND kind=?",
+        (symbol, kind)).fetchone()
+    if not row:
+        return False
+    age = _age_seconds(row["fetched_at"])
+    return age is not None and age < ttl_seconds
+
+
+def set_meta(conn, symbol: str, kind: str, source: str) -> None:
+    conn.execute(
+        """INSERT INTO md_fetch_meta(symbol, kind, fetched_at, source) VALUES (?,?,?,?)
+           ON CONFLICT(symbol, kind) DO UPDATE SET
+             fetched_at=excluded.fetched_at, source=excluded.source""",
+        (symbol, kind, _now(), source))
+    conn.commit()
+
+
+# ── OHLCV (md_ohlcv) ────────────────────────────────────────────────────────
+def ohlcv_bounds(conn, symbol: str) -> tuple[str, str] | None:
+    """(min_date, max_date) for a symbol, or None when nothing is cached."""
+    row = conn.execute(
+        "SELECT MIN(date) lo, MAX(date) hi FROM md_ohlcv WHERE symbol=?",
+        (symbol,)).fetchone()
+    if not row or row["lo"] is None:
+        return None
+    return (row["lo"], row["hi"])
+
+
+def get_ohlcv_range(conn, symbol: str, start: str, end: str) -> list[dict]:
+    rows = conn.execute(
+        """SELECT date, open, high, low, close, volume FROM md_ohlcv
+           WHERE symbol=? AND date>=? AND date<=? ORDER BY date""",
+        (symbol, start, end)).fetchall()
+    return [{"date": r["date"], "open": r["open"], "high": r["high"], "low": r["low"],
+             "close": r["close"], "volume": r["volume"] or 0.0} for r in rows]
+
+
+def upsert_ohlcv(conn, symbol: str, rows: list[dict], source: str) -> None:
+    conn.executemany(
+        """INSERT INTO md_ohlcv(symbol, date, open, high, low, close, volume, source)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(symbol, date) DO UPDATE SET
+             open=excluded.open, high=excluded.high, low=excluded.low,
+             close=excluded.close, volume=excluded.volume, source=excluded.source""",
+        [(symbol, r["date"], r.get("open"), r.get("high"), r.get("low"),
+          r.get("close"), r.get("volume"), source) for r in rows])
+    conn.commit()
+
+
+# ── Board (md_board) ─────────────────────────────────────────────────────────
+_BOARD_FIELDS = ("foreign_buy_value", "foreign_sell_value", "foreign_net_value",
+                 "ceiling", "floor", "ref_price", "close",
+                 "traded_value", "traded_volume")
+
+
+def latest_board(conn, symbol: str, ttl_seconds: float) -> dict | None:
+    """Most recent board snapshot for a symbol if within the TTL, else None."""
+    row = conn.execute(
+        "SELECT * FROM md_board WHERE symbol=? ORDER BY ts DESC LIMIT 1",
+        (symbol,)).fetchone()
+    if not row:
+        return None
+    age = _age_seconds(row["ts"])
+    if age is None or age >= ttl_seconds:
+        return None
+    return {f: row[f] for f in _BOARD_FIELDS}
+
+
+def insert_board(conn, board: dict[str, dict], source: str) -> None:
+    now = _now()
+    for sym, b in board.items():
+        conn.execute(
+            """INSERT INTO md_board(symbol, ts, foreign_buy_value, foreign_sell_value,
+                   foreign_net_value, ceiling, floor, ref_price, close,
+                   traded_value, traded_volume, source)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(symbol, ts) DO NOTHING""",
+            (sym, now, b.get("foreign_buy_value"), b.get("foreign_sell_value"),
+             b.get("foreign_net_value"), b.get("ceiling"), b.get("floor"),
+             b.get("ref_price"), b.get("close"),
+             b.get("traded_value"), b.get("traded_volume"), source))
+    conn.commit()
+
+
+# ── Statements (md_statements) ────────────────────────────────────────────────
+def get_statements(conn, symbol: str, period: str, ttl_seconds: float) -> tuple[bool, dict | None]:
+    """(found, payload): found=True when a fresh row exists (payload may be None for a
+    negative cache); found=False means cache miss — the adapter should fetch."""
+    row = conn.execute(
+        "SELECT payload, fetched_at FROM md_statements WHERE symbol=? AND period=?",
+        (symbol, period)).fetchone()
+    if not row:
+        return (False, None)
+    age = _age_seconds(row["fetched_at"])
+    if age is None or age >= ttl_seconds:
+        return (False, None)
+    payload = json.loads(row["payload"]) if row["payload"] else None
+    return (True, payload)
+
+
+def upsert_statements(conn, symbol: str, period: str, payload: dict | None, source: str) -> None:
+    conn.execute(
+        """INSERT INTO md_statements(symbol, period, payload, source, fetched_at)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(symbol, period) DO UPDATE SET
+             payload=excluded.payload, source=excluded.source, fetched_at=excluded.fetched_at""",
+        (symbol, period, json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+         source, _now()))
+    conn.commit()
+
+
+# ── Events (md_events) ────────────────────────────────────────────────────────
+def get_events(conn, symbol: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM md_events WHERE symbol=? ORDER BY ex_date", (symbol,)).fetchall()
+    return [{"symbol": symbol, "type": r["type"], "ex_date": r["ex_date"],
+             "record_date": r["record_date"], "pay_date": r["pay_date"],
+             "value_per_share": r["value_per_share"], "ratio": r["ratio"],
+             "title": r["title"], "event_code": r["event_code"]} for r in rows]
+
+
+def replace_events(conn, symbol: str, events: list[dict], source: str) -> None:
+    """Replace-all the cached events for a symbol (dividend calendars are revised, not appended)."""
+    now = _now()
+    conn.execute("DELETE FROM md_events WHERE symbol=?", (symbol,))
+    for e in events:
+        conn.execute(
+            """INSERT INTO md_events(symbol, event_code, type, ex_date, record_date,
+                   pay_date, value_per_share, ratio, title, source, fetched_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (symbol, e.get("event_code"), e.get("type"), e.get("ex_date"),
+             e.get("record_date"), e.get("pay_date"), e.get("value_per_share"),
+             e.get("ratio"), e.get("title"), source, now))
+    conn.commit()
+
+
+# ── Index constituents (md_index_members) ─────────────────────────────────────
+def get_index_members(conn, group: str) -> list[str]:
+    """Cached members of an index group, in the source's own order."""
+    rows = conn.execute(
+        "SELECT symbol FROM md_index_members WHERE grp=? ORDER BY ordinal", (group,)).fetchall()
+    return [r["symbol"] for r in rows]
+
+
+def replace_index_members(conn, group: str, symbols: list[str], source: str) -> None:
+    """Replace-all the membership of a group (indices are rebalanced, not appended)."""
+    now = _now()
+    conn.execute("DELETE FROM md_index_members WHERE grp=?", (group,))
+    conn.executemany(
+        """INSERT INTO md_index_members(grp, symbol, ordinal, source, fetched_at)
+           VALUES (?,?,?,?,?)""",
+        [(group, s, i, source, now) for i, s in enumerate(symbols)])
+    conn.commit()

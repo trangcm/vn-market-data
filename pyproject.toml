@@ -1,0 +1,52 @@
+# The packaging metadata lives *inside* the package directory on purpose. This
+# directory is a subtree of a larger monorepo, and the public repository is produced by
+# `git subtree split --prefix=services/market-intel/vn_market_data` — so anything the
+# published package needs has to sit under this prefix or it will not come along.
+#
+# That makes this directory both the package and the distribution root, which is what
+# the `package-dir` mapping below reconciles: `vn_market_data` is this directory, and
+# `vn_market_data.sources` is `./sources`.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vn-market-data"
+version = "0.1.0"
+description = "Cache-first, source-abstracted market data for the Vietnamese stock market (HOSE/HNX/UPCOM)."
+readme = "README.md"
+license = { file = "LICENSE" }
+# 3.10 is the floor, not a preference: the code uses PEP 604 unions (`dict | None`) and
+# an assignment expression inside a comprehension. Tested on 3.10 and 3.12.
+requires-python = ">=3.10"
+authors = [{ name = "Mino", email = "mino.gb@gmail.com" }]
+keywords = ["vietnam", "stock-market", "hose", "ohlcv", "market-data", "vnstock"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+# The base install is deliberately light: DNSE (OHLCV) and VNDirect (market turnover)
+# are pure httpx, and SQLite is in the standard library. Nothing here pulls pandas.
+dependencies = ["httpx>=0.24"]
+
+[project.optional-dependencies]
+# The VCI backend — the only source for the price board, financial statements and
+# corporate actions, and the OHLCV fallback. vnstock pulls pandas, which is most of the
+# install size, so it stays opt-in; build_sources() drops VCI and logs a warning when
+# it is absent rather than letting an ImportError surface mid-fetch.
+vci = ["vnstock>=4.0,<5.0"]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["vn_market_data", "vn_market_data.sources"]
+package-dir = { "vn_market_data" = "." }
+
+[tool.setuptools.package-data]
+vn_market_data = ["schema.sql"]
