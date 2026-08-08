@@ -134,6 +134,34 @@ The package borrows a connection, uses it, and closes it — your application ke
 ownership of the path, the pragmas and the lifecycle. This matters more than it sounds:
 opening a second database beside yours splits the cache in half and doubles the WAL.
 
+## What a cached read costs
+
+The pitch is that you can ask for the same candles as often as you like and the network
+stays out of it, so the honest thing to publish is what the cache hit costs. Measured by
+`benchmarks/bench_store.py` (fake sources, temp SQLite, `synchronous=OFF`) on a Linux
+x86_64 box, CPython 3.10 — treat these as an order of magnitude, not a promise:
+
+| Read | Rows | Median |
+|---|---|---|
+| `get_ohlcv`, 2 years, warm | 522 | **0.98 ms** |
+| `get_ohlcv`, 10 years, warm | 2,608 | **3.9 ms** |
+| `get_ohlcv`, 2 years, cold (fetch + upsert + read back) | 565 | 2.4 ms |
+| `get_board`, 50 symbols, warm | 50 | 0.75 ms |
+| `get_board`, 400 symbols (≈ the HOSE listing), warm | 400 | **4.8 ms** |
+
+Roughly 2 µs per candle and 12 µs per symbol of board, both linear in what you asked for:
+5× the rows costs 4.0×, 8× the symbols costs 6.4×. The board is one query per symbol by
+design — batching it would trade a clear failure mode for a fast one.
+
+The number worth watching over time is the last row of the benchmark: `md_board` is
+append-only, and reading the *latest* snapshot for 400 symbols with 120 snapshots each
+behind them costs 1.3× reading it with one each. That is the shape you want, and it is
+benchmarked rather than assumed because it would degrade silently — the reads stay
+correct and just get slower. If it ever climbs, `md_board` wants an index on
+`(symbol, ts)` or a retention sweep.
+
+Run it yourself: `python -m vn_market_data.benchmarks.bench_store` (writes JSON to stdout).
+
 ## Non-goals
 
 - **Not a replacement for `vnstock`.** This layers on top of it and on the raw HTTP
@@ -155,6 +183,7 @@ pip install -e ".[vci,dev]"
 pytest tests/ -q                  # offline: fake sources, temp SQLite, no network
 python examples/quickstart.py     # hits the real endpoints
 python examples/diagnose_sources.py HPG   # which source answers, and do they agree?
+python -m vn_market_data.benchmarks.bench_store   # timings above, on your machine
 ```
 
 If something is wrong, `diagnose_sources.py` is the first thing to run and the most

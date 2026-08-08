@@ -1,0 +1,18 @@
+{
+ "suite": "vn-market-data",
+ "recorded_at": "2026-08-08T08:00:02+00:00",
+ "machine": {
+  "python": "3.10.12",
+  "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+  "processor": "x86_64"
+ },
+ "tolerance": 1.5,
+ "metrics": {
+  "ohlcv.warm_read_2y": 0.9773,
+  "ohlcv.warm_read_10y": 3.9344,
+  "ohlcv.cold_fetch_2y": 2.4157,
+  "board.warm_read_50": 0.7518,
+  "board.warm_read_400": 4.7911,
+  "board.warm_read_400_deep_history": 6.3642
+ }
+}
