@@ -13,7 +13,11 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# Runs from a checkout without installing; from an installed package the guard is a
+# no-op, since there is then no enclosing `vn_market_data/` directory to point at.
+_root = Path(__file__).resolve().parents[2]
+if (_root / "vn_market_data").is_dir():
+    sys.path.insert(0, str(_root))
 
 import vn_market_data as vmd  # noqa: E402
 
@@ -53,9 +57,12 @@ def price_board():
               "fall back to candles knowingly")
         return
     for sym, b in board.items():
+        # Every md_board column is nullable and the degraded path serves whatever the
+        # last snapshot held, so nothing here can be formatted as a number unguarded.
+        floor, ceiling = b.get("floor"), b.get("ceiling")
+        band = f"{floor:,.0f} .. {ceiling:,.0f}" if floor and ceiling else "n/a"
         print(f"\n{sym} board:")
-        print(f"  close {b.get('close'):>12,.0f}   band {b.get('floor'):,.0f} .. "
-              f"{b.get('ceiling'):,.0f}")
+        print(f"  close {b.get('close') or 0:>12,.0f}   band {band}")
         print(f"  foreign net {b.get('foreign_net_value') or 0:>+15,.0f} VND"
               f"   traded {b.get('traded_value') or 0:>15,.0f} VND")
 

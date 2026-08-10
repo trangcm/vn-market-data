@@ -33,12 +33,27 @@ def meta_fresh(conn, symbol: str, kind: str, ttl_seconds: float) -> bool:
     return age is not None and age < ttl_seconds
 
 
-def set_meta(conn, symbol: str, kind: str, source: str) -> None:
+def meta_floor(conn, symbol: str, kind: str) -> str | None:
+    """The oldest date ever *asked* for (ohlcv), or None if never recorded.
+
+    Distinct from the oldest date banked: a symbol listed eight months ago answers a
+    two-year request with eight months of candles and that is the complete answer.
+    Comparing the next request against the data floor would call that a miss forever.
+    """
+    row = conn.execute(
+        "SELECT floor FROM md_fetch_meta WHERE symbol=? AND kind=?",
+        (symbol, kind)).fetchone()
+    return row["floor"] if row else None
+
+
+def set_meta(conn, symbol: str, kind: str, source: str, floor: str | None = None) -> None:
     conn.execute(
-        """INSERT INTO md_fetch_meta(symbol, kind, fetched_at, source) VALUES (?,?,?,?)
+        """INSERT INTO md_fetch_meta(symbol, kind, fetched_at, source, floor)
+           VALUES (?,?,?,?,?)
            ON CONFLICT(symbol, kind) DO UPDATE SET
-             fetched_at=excluded.fetched_at, source=excluded.source""",
-        (symbol, kind, _now(), source))
+             fetched_at=excluded.fetched_at, source=excluded.source,
+             floor=COALESCE(excluded.floor, md_fetch_meta.floor)""",
+        (symbol, kind, _now(), source, floor))
     conn.commit()
 
 

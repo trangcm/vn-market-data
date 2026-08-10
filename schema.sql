@@ -72,5 +72,6 @@ CREATE TABLE IF NOT EXISTS md_fetch_meta (
     kind       TEXT NOT NULL,               -- 'ohlcv' | 'events' | 'board'
     fetched_at TEXT NOT NULL,
     source     TEXT NOT NULL,
+    floor      TEXT,                        -- oldest date ever *asked* for (ohlcv only)
     PRIMARY KEY (symbol, kind)
 );

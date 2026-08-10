@@ -73,13 +73,17 @@ def _seed_ohlcv(symbol: str, back: int) -> None:
     """Fill the store the way a real first run would — through the adapter, so the
     freshness metadata lands too and the next call is genuinely a warm read.
 
-    The series starts *earlier* than any lookback we then ask for. Otherwise
-    `get_ohlcv` sees a stored history shallower than the request, decides it needs
-    deeper data, and refetches on every single call — which would make this benchmark
-    measure the fake source instead of the store, and look suspiciously fast.
+    Both the canned series *and* the seeding request reach back further than the
+    lookback we then measure, and the second one is the subtle half: the adapter passes
+    its own `today - lookback` down as the source's `start`, so seeding at `back` would
+    filter the deeper candles out at the source and bank a history whose oldest row is
+    the first *business* day on or after `today - back`. Whenever that date is a
+    weekend, `get_ohlcv` would then see a stored history shallower than the request,
+    refetch on every single call, and quietly turn the warm-read benchmark into a second
+    measurement of the cold path — two days in seven, depending only on the calendar.
     """
     vmd.set_sources([_Canned(_candles(back + 60), _BOARD_ROW)])
-    vmd.get_ohlcv(symbol, lookback_days=back)
+    vmd.get_ohlcv(symbol, lookback_days=back + 60)
 
 
 def _seed_board(symbols: list[str], snapshots_per_symbol: int) -> None:

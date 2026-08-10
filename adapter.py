@@ -6,7 +6,10 @@ down the chain; a source that raises ``NotSupported`` or ``SourceUnavailable`` f
 through to the next, but a genuinely-empty answer (``[]``/``None``) is **authoritative
 and stops the chain** — "this symbol has no dividends" is a real answer, not a failure.
 If *every* source is unavailable the ``SourceUnavailable`` propagates, so a caller can
-tell "nothing to report" apart from "nobody answered".
+tell "nothing to report" apart from "nobody answered" — except where the store already
+holds an answer worth serving, which is the point of the layer: candles, the board and
+the index constituents degrade to what is banked, and only a cold cache raises. See the
+degradation table in the README.
 
 The whole layer is synchronous: the VCI backend (vnstock) is blocking, and SQLite reads
 are sub-millisecond. Run it under a threadpool if you need concurrency — a future async
@@ -98,11 +101,19 @@ def get_ohlcv(symbol: str, lookback_days: int = 730, *,
     with closing(connect()) as conn:
         bounds = store.ohlcv_bounds(conn, symbol)
         fetch_from = None
+        floor = None
         if bounds is None:
             fetch_from = start                                   # cold cache → full backfill
         else:
             min_d, max_d = bounds
-            if min_d > start:
+            # Against the deepest window ever *asked* for, not the oldest candle banked.
+            # A symbol listed eight months ago answers a two-year request with eight
+            # months, and that is the whole answer — comparing against the data floor
+            # would read it as a miss and refetch its entire history on every call, for
+            # every recent listing, forever. A cache with no floor recorded yet falls
+            # back to the data floor, i.e. probes once and then records what it learned.
+            floor = store.meta_floor(conn, symbol, "ohlcv") or min_d
+            if start < floor:
                 fetch_from = start                               # need deeper history → refetch
             elif (not store.meta_fresh(conn, symbol, "ohlcv", ttl_s)
                   and end > max_d and today.weekday() < 5):
@@ -113,10 +124,25 @@ def get_ohlcv(symbol: str, lookback_days: int = 730, *,
                 fetch_from = max_d
 
         if fetch_from is not None:
-            src, rows = _query("get_ohlcv", symbol, fetch_from, end, is_index=is_index)
-            if rows:
-                store.upsert_ohlcv(conn, symbol, rows, src)
-            store.set_meta(conn, symbol, "ohlcv", src)
+            try:
+                src, rows = _query("get_ohlcv", symbol, fetch_from, end, is_index=is_index)
+            except SourceUnavailable as e:
+                # Nobody answered, but the store is holding real history — serve it. The
+                # alternative fails a whole pipeline pass over a tail that is at most one
+                # session short. A cold cache is the one case with nothing to fall back
+                # on, and there "nobody answered" is the only honest answer. Freshness is
+                # deliberately *not* stamped, so the next call retries rather than
+                # sitting out the TTL on the strength of a failure.
+                if bounds is None:
+                    raise
+                log.warning("ohlcv unavailable for %s (%s) — serving %s..%s from the store",
+                            symbol, e, *bounds)
+            else:
+                if rows:
+                    store.upsert_ohlcv(conn, symbol, rows, src)
+                # A tail top-up starts at max_d and must not raise the floor with it.
+                store.set_meta(conn, symbol, "ohlcv", src,
+                               floor=min(fetch_from, floor) if floor else fetch_from)
 
         return store.get_ohlcv_range(conn, symbol, start, end)
 

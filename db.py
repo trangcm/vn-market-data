@@ -90,3 +90,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE md_board ADD COLUMN traded_value REAL")
     if bcols and "traded_volume" not in bcols:
         conn.execute("ALTER TABLE md_board ADD COLUMN traded_volume REAL")
+
+    mcols = {r[1] for r in conn.execute("PRAGMA table_info(md_fetch_meta)")}
+    if mcols and "floor" not in mcols:
+        # The oldest date ever requested, as opposed to the oldest one banked. Rows
+        # written before this column existed stay NULL and fall back to the data floor,
+        # which is the old behaviour — so an existing cache re-probes each symbol once
+        # and records its answer.
+        conn.execute("ALTER TABLE md_fetch_meta ADD COLUMN floor TEXT")

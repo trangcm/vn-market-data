@@ -8,6 +8,7 @@ These tests go with the package if it is ever split out, so they reach it only t
 its public surface: ``set_sources`` and ``set_connection_factory``, never a monkeypatched
 module global. ``test_package_boundary.py`` enforces the other half of that.
 """
+import logging
 import sqlite3
 from datetime import date, timedelta
 
@@ -298,6 +299,72 @@ def test_deeper_lookback_refetches_rather_than_tops_up(temp_db, monkeypatch):
     rows = adapter.get_ohlcv("HPG", lookback_days=180)
     assert src.calls[1][0] == (_WED - timedelta(days=180)).isoformat()
     assert len(rows) > 150
+
+
+def test_short_history_is_not_refetched_on_every_call(temp_db, monkeypatch):
+    """A symbol listed after the lookback window begins answers with everything it has,
+    and that is the complete answer. Measured against the oldest candle *banked* it looks
+    like a permanent cache miss, so every recent listing would refetch its whole history
+    on every pass — the exact traffic this package exists to remove."""
+    listed = _WED - timedelta(days=40)              # 40 days of history, 180 requested
+    src = _RangeSrc(_rows_between(listed, _WED))
+    vmd.set_sources([src])
+    _pin_today(monkeypatch, _WED)
+
+    first = adapter.get_ohlcv("NEW", lookback_days=180)
+    assert len(src.calls) == 1
+    assert len(first) == len(_rows_between(listed, _WED))
+
+    # Same window again, and again with the TTL stale — the store already holds every
+    # candle that exists and the tail is current, so neither call reaches the source.
+    again = adapter.get_ohlcv("NEW", lookback_days=180)
+    adapter.get_ohlcv("NEW", lookback_days=180, ttl_s=0)
+    assert len(src.calls) == 1, "a short history is the whole answer, not a cache miss"
+    assert len(again) == len(first)
+
+    # Next weekday with the TTL stale: the tail is genuinely one session behind, so this
+    # does fetch — but only from the last candle held, not from the front again.
+    _pin_today(monkeypatch, _WED + timedelta(days=1))
+    adapter.get_ohlcv("NEW", lookback_days=180, ttl_s=0)
+    assert len(src.calls) == 2
+    assert src.calls[-1][0] == _WED.isoformat(), "top-up must start at max_d, not at start"
+
+    # But a genuinely deeper request is still a miss.
+    adapter.get_ohlcv("NEW", lookback_days=365)
+    assert src.calls[-1][0] == (_WED + timedelta(days=1) - timedelta(days=365)).isoformat()
+
+
+def test_ohlcv_degrades_to_banked_candles_when_every_source_is_down(temp_db, monkeypatch,
+                                                                   caplog):
+    """A warm store outlives an outage. Raising here would fail a whole pipeline pass —
+    patterns, RS, backtests all read candles — over a tail one session short."""
+    src = _RangeSrc(_rows_between(_WED - timedelta(days=60), _WED))
+    vmd.set_sources([src])
+    _pin_today(monkeypatch, _WED)
+    adapter.get_ohlcv("HPG", lookback_days=30)
+
+    vmd.set_sources([_Src("down", raises=SourceUnavailable("ConnectionError"))])
+    _pin_today(monkeypatch, _WED + timedelta(days=1))
+    with caplog.at_level(logging.WARNING):
+        rows = adapter.get_ohlcv("HPG", lookback_days=30, ttl_s=0)
+    assert len(rows) > 15
+    assert "unavailable" in caplog.text
+
+    # Freshness must not have been re-stamped on the strength of a failure, or the TTL
+    # would sit the next call out too and the outage would outlive itself. The meta row
+    # still names the last source that actually answered.
+    with vmd.connect() as conn:
+        meta = conn.execute("SELECT source FROM md_fetch_meta "
+                            "WHERE symbol='HPG' AND kind='ohlcv'").fetchone()
+    assert meta["source"] == "range", "a failed fetch must not count as a fresh one"
+
+
+def test_ohlcv_raises_when_every_source_is_down_and_nothing_is_banked(temp_db, monkeypatch):
+    """The one case with nothing to serve: "nobody answered" must not read as "no data"."""
+    vmd.set_sources([_Src("down", raises=SourceUnavailable("ConnectionError"))])
+    _pin_today(monkeypatch, _WED)
+    with pytest.raises(SourceUnavailable):
+        adapter.get_ohlcv("HPG", lookback_days=30)
 
 
 # ── DA-U-01: get_index_live — uncached, and never stored ─────────────────────

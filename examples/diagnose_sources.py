@@ -22,7 +22,11 @@ Network required. Nothing is written to any database.
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# Runs from a checkout without installing; from an installed package the guard is a
+# no-op, since there is then no enclosing `vn_market_data/` directory to point at.
+_root = Path(__file__).resolve().parents[2]
+if (_root / "vn_market_data").is_dir():
+    sys.path.insert(0, str(_root))
 
 from vn_market_data import NotSupported, SourceUnavailable, build_sources  # noqa: E402
 

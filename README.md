@@ -53,6 +53,8 @@ new source.
 | Cache is warm | Local read. No network. |
 | Cache is cold | Full backfill from the head source, written through. |
 | New trading day, weekday | Tail top-up only (not a refetch). |
+| Deeper `lookback_days` than before | Refetch from the new floor, once. Asking *shallower* again is a local read. |
+| Listed after the window starts | Everything that exists, and that is the whole answer — not re-probed on every call. |
 | Weekend / holiday | Nothing is fetched — the session will never print. |
 | Head source down | Next source in the chain, transparently. |
 | **Every** source down, board | The last stored snapshot, up to 6 h old. |
