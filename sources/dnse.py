@@ -14,6 +14,7 @@ capability it has, quickly, and abstains from the rest.
 
 Pure ``httpx``, no pandas — which is what keeps the base install light.
 """
+import json
 import logging
 import math
 from datetime import datetime, timezone, timedelta
@@ -21,6 +22,7 @@ from datetime import datetime, timezone, timedelta
 import httpx
 
 from vn_market_data.sources.base import DataSource, SourceUnavailable
+from vn_market_data.sources.http import get_capped
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +39,32 @@ def _f(v):
         x = float(v)
         return None if math.isnan(x) else x
     except (TypeError, ValueError):
+        return None
+
+
+def _arr(j: dict, key: str) -> list:
+    """One of the payload's parallel arrays, or ``[]`` if it isn't an array.
+
+    The feed answers ``{t:[…], o:[…], h:[…], l:[…], c:[…], v:[…]}``. Indexing whatever
+    turns up under those keys is only safe while the answer really is that shape.
+    """
+    val = j.get(key)
+    return val if isinstance(val, list) else []
+
+
+def _bar_date(v) -> str | None:
+    """Unix seconds → that bar's Vietnam trading date, or None when the value isn't one.
+
+    Every *price* field goes through ``_f``; the timestamp is the one field that came
+    off the wire uncoerced, and it sits outside the ``try`` that covers the fetch — so a
+    ``t`` array carrying a string, a null or a number outside ``time_t`` raised
+    ``TypeError``/``OverflowError`` straight out of the parse loop and into the caller's
+    stack. The contract here is candles, ``[]`` or ``SourceUnavailable``, never an
+    arbitrary exception, and a source is only ever as trustworthy as its worst response.
+    """
+    try:
+        return datetime.fromtimestamp(v, tz=_VN_TZ).date().isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
         return None
 
 
@@ -61,28 +89,31 @@ class DNSESource(DataSource):
         params = {"from": frm, "to": to, "symbol": symbol, "resolution": "1D"}
 
         try:
-            r = httpx.get(f"{_BASE}/{kind}", params=params, headers=_HEADERS, timeout=_TIMEOUT)
+            status, body = get_capped(f"{_BASE}/{kind}", params=params, headers=_HEADERS,
+                                      timeout=_TIMEOUT, what=f"dnse {symbol} OHLCV")
         except httpx.HTTPError as e:           # timeout / connect / read error → transient
             log.warning("dnse: %s OHLCV network error — %s", symbol, e)
             raise SourceUnavailable(symbol) from None
 
-        if r.status_code == 429 or r.status_code >= 500:
-            log.warning("dnse: %s OHLCV HTTP %s — unavailable", symbol, r.status_code)
+        if status == 429 or status >= 500:
+            log.warning("dnse: %s OHLCV HTTP %s — unavailable", symbol, status)
             raise SourceUnavailable(symbol)
-        if r.status_code != 200:               # 400 invalid symbol etc. — genuine no-data
-            log.warning("dnse: %s OHLCV HTTP %s — no data", symbol, r.status_code)
+        if status != 200:                      # 400 invalid symbol etc. — genuine no-data
+            log.warning("dnse: %s OHLCV HTTP %s — no data", symbol, status)
             return []
         try:
-            j = r.json()
+            j = json.loads(body)
         except ValueError:
             log.warning("dnse: %s OHLCV non-JSON body", symbol)
             return []
+        if not isinstance(j, dict):            # a bare list/string is not this API's shape
+            log.warning("dnse: %s OHLCV unexpected payload shape", symbol)
+            return []
 
-        t = j.get("t") or []
-        c = j.get("c") or []
+        t, c = _arr(j, "t"), _arr(j, "c")
         if not t or not c:
             return []
-        o, h, l, v = j.get("o", []), j.get("h", []), j.get("l", []), j.get("v", [])
+        o, h, l, v = _arr(j, "o"), _arr(j, "h"), _arr(j, "l"), _arr(j, "v")
         scale = 1.0 if is_index else _PRICE_SCALE
 
         out: list[dict] = []
@@ -91,7 +122,9 @@ class DNSESource(DataSource):
             oi = _f(o[i]) if i < len(o) else None
             hi = _f(h[i]) if i < len(h) else None
             li = _f(l[i]) if i < len(l) else None
-            date = datetime.fromtimestamp(t[i], tz=_VN_TZ).date().isoformat()
+            date = _bar_date(t[i])
+            if date is None:                   # unreadable timestamp → drop the bar, not the fetch
+                continue
             if is_index:
                 # Index keeps rows with a close even if o/h/l are missing (unscaled).
                 if ci is None:
@@ -129,25 +162,27 @@ class DNSESource(DataSource):
                   "to": int(now.timestamp()) + 60,
                   "symbol": symbol, "resolution": "1"}
         try:
-            r = httpx.get(f"{_BASE}/index", params=params, headers=_HEADERS, timeout=_TIMEOUT)
+            status, body = get_capped(f"{_BASE}/index", params=params, headers=_HEADERS,
+                                      timeout=_TIMEOUT, what=f"dnse {symbol} intraday")
         except httpx.HTTPError as e:
             log.warning("dnse: %s intraday network error — %s", symbol, e)
             raise SourceUnavailable(symbol) from None
 
-        if r.status_code == 429 or r.status_code >= 500:
+        if status == 429 or status >= 500:
             raise SourceUnavailable(symbol)
-        if r.status_code != 200:
+        if status != 200:
             return None
         try:
-            j = r.json()
+            j = json.loads(body)
         except ValueError:
             return None
+        if not isinstance(j, dict):
+            return None
 
-        t, c = j.get("t") or [], j.get("c") or []
-        o, h, l, v = j.get("o", []), j.get("h", []), j.get("l", []), j.get("v", [])
+        t, c = _arr(j, "t"), _arr(j, "c")
+        o, h, l, v = _arr(j, "o"), _arr(j, "h"), _arr(j, "l"), _arr(j, "v")
         bars = [i for i in range(min(len(t), len(c)))
-                if datetime.fromtimestamp(t[i], tz=_VN_TZ).date().isoformat() == today
-                and _f(c[i]) is not None]
+                if _bar_date(t[i]) == today and _f(c[i]) is not None]
         if not bars:
             return None
 

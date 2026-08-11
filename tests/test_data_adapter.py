@@ -2,7 +2,7 @@
 
 The store-first cache, the head-first source fallback chain, and the source
 contract — all exercised with a temp SQLite DB and fake sources, so nothing here
-touches DNSE/VCI or the real /data/news.db.
+touches DNSE/VCI or any real database.
 
 These tests go with the package if it is ever split out, so they reach it only through
 its public surface: ``set_sources`` and ``set_connection_factory``, never a monkeypatched
@@ -156,8 +156,8 @@ def test_vci_board_resolves_the_match_price_not_the_auction_one():
 def temp_db(tmp_path, restore_sources):
     """Hand the package a fresh temp SQLite DB the way a host application does — through
     the public connection factory, not a monkeypatched module global. Whatever factory
-    was installed (market-intel installs its own on import) goes back on teardown."""
-    path = tmp_path / "news.db"
+    was installed (a host installs its own on import) goes back on teardown."""
+    path = tmp_path / "test.db"
 
     def _connect():
         conn = sqlite3.connect(path, check_same_thread=False)

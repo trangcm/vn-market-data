@@ -46,8 +46,8 @@ class NotSupported(Exception):
 
 class SourceUnavailable(Exception):
     """Transient unavailability (rate-limited / network / 5xx). The adapter tries the
-    next source; if *every* source is unavailable it propagates and the scraper shim
-    maps it to its existing ``FeedUnavailable`` (→ HTTP 503 / scheduler stop-and-resume)."""
+    next source; if *every* source is unavailable it propagates, so a caller can tell
+    "the market has no answer" from "nobody could be reached" and retry only the second."""
 
 
 class DataSource:
