@@ -16,8 +16,8 @@ every call after that is served from disk and only the new session's tail is fet
 Not on PyPI — install from the repository:
 
 ```
-pip install "vn-market-data @ git+https://github.com/<OWNER>/vn-market-data"
-pip install "vn-market-data[vci] @ git+https://github.com/<OWNER>/vn-market-data"
+pip install "vn-market-data @ git+https://github.com/trangcm/vn-market-data"
+pip install "vn-market-data[vci] @ git+https://github.com/trangcm/vn-market-data"
 ```
 
 The base install is DNSE (OHLCV) + VNDirect (turnover) and is pure `httpx`; the `vci`
