@@ -37,8 +37,10 @@ classifiers = [
 dependencies = ["httpx>=0.24"]
 
 # The repository these point at is the one produced by the subtree split, not the
-# monorepo — it is the only checkout a reader can act on. Swap trangcm for the real
-# account before the first push; the README's install line carries the same placeholder.
+# monorepo — it is the only checkout a reader can act on. If the package ever moves
+# accounts, these three and the README's install line have to move together;
+# `scripts/release-vn-market-data.sh` only fills an unset placeholder, it will not
+# rewrite a URL that is already here.
 [project.urls]
 Homepage = "https://github.com/trangcm/vn-market-data"
 Source = "https://github.com/trangcm/vn-market-data"
