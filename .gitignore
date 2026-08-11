@@ -1,0 +1,29 @@
+# This file exists for the *split* repo. Inside the monorepo the root .gitignore
+# already covers everything here; once `git subtree split --prefix=` lifts this
+# directory out, that root file does not come along, and the patterns below are the
+# ones this package generates on its own.
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# The default store: a bare `pip install` with no connection factory opens
+# ./vn_market_data.db and creates the schema itself, so a quickstart run or a
+# benchmark pass drops one of these in the working directory.
+*.db
+*.db-wal
+*.db-shm
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -36,6 +36,14 @@ classifiers = [
 # are pure httpx, and SQLite is in the standard library. Nothing here pulls pandas.
 dependencies = ["httpx>=0.24"]
 
+# The repository these point at is the one produced by the subtree split, not the
+# monorepo — it is the only checkout a reader can act on. Swap <OWNER> for the real
+# account before the first push; the README's install line carries the same placeholder.
+[project.urls]
+Homepage = "https://github.com/<OWNER>/vn-market-data"
+Source = "https://github.com/<OWNER>/vn-market-data"
+Issues = "https://github.com/<OWNER>/vn-market-data/issues"
+
 [project.optional-dependencies]
 # The VCI backend — the only source for the price board, financial statements and
 # corporate actions, and the OHLCV fallback. vnstock pulls pandas, which is most of the

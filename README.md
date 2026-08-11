@@ -13,10 +13,16 @@ board   = get_board(["HPG", "VNM"])             # foreign flow, limit bands, tra
 No setup. The first call creates a SQLite file (`./vn_market_data.db`) and backfills it;
 every call after that is served from disk and only the new session's tail is fetched.
 
+Not on PyPI — install from the repository:
+
 ```
-pip install vn-market-data          # DNSE (OHLCV) + VNDirect (turnover) — pure httpx
-pip install vn-market-data[vci]     # adds price board, statements, corporate actions
+pip install "vn-market-data @ git+https://github.com/<OWNER>/vn-market-data"
+pip install "vn-market-data[vci] @ git+https://github.com/<OWNER>/vn-market-data"
 ```
+
+The base install is DNSE (OHLCV) + VNDirect (turnover) and is pure `httpx`; the `vci`
+extra adds the price board, statements and corporate actions, and pulls `vnstock`
+(and therefore pandas) with it.
 
 ## Why this exists
 
