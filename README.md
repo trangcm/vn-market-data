@@ -13,12 +13,17 @@ board   = get_board(["HPG", "VNM"])             # foreign flow, limit bands, tra
 No setup. The first call creates a SQLite file (`./vn_market_data.db`) and backfills it;
 every call after that is served from disk and only the new session's tail is fetched.
 
-Not on PyPI — install from the repository:
+Not on PyPI — install from the repository, at a tag:
 
 ```
-pip install "vn-market-data @ git+https://github.com/trangcm/vn-market-data"
-pip install "vn-market-data[vci] @ git+https://github.com/trangcm/vn-market-data"
+pip install "vn-market-data @ git+https://github.com/trangcm/vn-market-data@v0.1.1"
+pip install "vn-market-data[vci] @ git+https://github.com/trangcm/vn-market-data@v0.1.1"
 ```
+
+Pin the tag. Without `@v0.1.1` pip takes whatever the default branch happens to be at
+that moment, so the same command means something different tomorrow and an install
+cannot be reproduced. Releases never move a tag once it is pushed, so a pinned install
+is the one that stays what you tested against.
 
 The base install is DNSE (OHLCV) + VNDirect (turnover) and is pure `httpx`; the `vci`
 extra adds the price board, statements and corporate actions, and pulls `vnstock`

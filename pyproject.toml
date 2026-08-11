@@ -1,7 +1,7 @@
-# The packaging metadata lives *inside* the package directory on purpose. This
-# directory is a subtree of a larger monorepo, and the public repository is produced by
-# `git subtree split --prefix=services/market-intel/vn_market_data` — so anything the
-# published package needs has to sit under this prefix or it will not come along.
+# The packaging metadata lives *inside* the package directory on purpose. This package
+# is developed as a subtree of a larger application and published by `git subtree split`,
+# so anything the released package needs has to sit under this directory or it will not
+# come along.
 #
 # That makes this directory both the package and the distribution root, which is what
 # the `package-dir` mapping below reconciles: `vn_market_data` is this directory, and
@@ -13,14 +13,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vn-market-data"
-version = "0.1.0"
+version = "0.1.1"
 description = "Cache-first, source-abstracted market data for the Vietnamese stock market (HOSE/HNX/UPCOM)."
 readme = "README.md"
 license = { file = "LICENSE" }
 # 3.10 is the floor, not a preference: the code uses PEP 604 unions (`dict | None`) and
 # an assignment expression inside a comprehension. Tested on 3.10 and 3.12.
 requires-python = ">=3.10"
-authors = [{ name = "Mino", email = "mino.gb@gmail.com" }]
+# A GitHub noreply address, not a personal mailbox: this field ends up in the wheel's
+# METADATA and on every mirror that ever indexes it, and it is not a support channel.
+# Bug reports go to the Issues URL below, which is the one that actually gets read.
+authors = [{ name = "Mino", email = "trangcm@users.noreply.github.com" }]
 keywords = ["vietnam", "stock-market", "hose", "ohlcv", "market-data", "vnstock"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -36,11 +39,10 @@ classifiers = [
 # are pure httpx, and SQLite is in the standard library. Nothing here pulls pandas.
 dependencies = ["httpx>=0.24"]
 
-# The repository these point at is the one produced by the subtree split, not the
-# monorepo — it is the only checkout a reader can act on. If the package ever moves
-# accounts, these three and the README's install line have to move together;
-# `scripts/release-vn-market-data.sh` only fills an unset placeholder, it will not
-# rewrite a URL that is already here.
+# The repository these point at is the published one produced by the subtree split — it
+# is the only checkout a reader can act on. If the package ever moves accounts, these
+# three and the README's install line have to move together; the release script only
+# fills an unset placeholder, it will not rewrite a URL that is already here.
 [project.urls]
 Homepage = "https://github.com/trangcm/vn-market-data"
 Source = "https://github.com/trangcm/vn-market-data"

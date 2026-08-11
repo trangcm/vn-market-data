@@ -14,11 +14,13 @@ the open, so the current session can be read straight off the tail.
 This source implements *only* ``get_market_turnover`` — everything else falls through
 to the next source in the chain.
 """
+import json
 import logging
 
 import httpx
 
 from vn_market_data.sources.base import DataSource, SourceUnavailable
+from vn_market_data.sources.http import get_capped
 
 log = logging.getLogger(__name__)
 
@@ -43,17 +45,24 @@ class VNDirectSource(DataSource):
         params = {"q": f"code:{index}~date:gte:{start}~date:lte:{end}",
                   "size": str(_MAX_ROWS), "sort": "date"}
         try:
-            r = httpx.get(_URL, params=params, headers=_HEADERS, timeout=_TIMEOUT)
-            r.raise_for_status()
-            rows = (r.json() or {}).get("data") or []
+            status, body = get_capped(_URL, params=params, headers=_HEADERS,
+                                      timeout=_TIMEOUT, what="vndirect market turnover")
         except httpx.HTTPError as e:
             raise SourceUnavailable(f"vndirect market turnover: {e}") from None
+        if status != 200:                             # this endpoint has no 'no data' status
+            raise SourceUnavailable(f"vndirect market turnover: HTTP {status}")
+        try:
+            payload = json.loads(body)
         except ValueError as e:                       # malformed JSON
             log.warning("vndirect: unparseable turnover response — %s", e)
             return []
+        rows = (payload or {}).get("data") if isinstance(payload, dict) else None
+        rows = rows if isinstance(rows, list) else []
 
         out = []
         for row in rows:
+            if not isinstance(row, dict):             # not this API's shape — skip the row
+                continue
             d, total = row.get("date"), _num(row.get("accumulatedVal"))
             if not d or not total:
                 continue

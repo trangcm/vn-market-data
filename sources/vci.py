@@ -29,8 +29,8 @@ def vnstock_installed() -> bool:
     surface from the middle of a fetch."""
     return importlib.util.find_spec("vnstock") is not None
 
-# vnstock VCI quotes equity prices in THOUSANDS of VND; scale to full VND so the
-# stored series lines up with stock-manager's prices. The index level is NOT scaled.
+# vnstock VCI quotes equity prices in THOUSANDS of VND; scale to full VND so the stored
+# series lines up with every other source's. The index level is NOT scaled.
 _PRICE_SCALE = 1000.0
 
 # ...and the price board's accumulated (traded) value in MILLIONS of VND.

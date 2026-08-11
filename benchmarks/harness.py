@@ -104,11 +104,17 @@ def ratio(name: str, slow: dict, fast: dict, *, limit: float, note: str = "") ->
 def machine() -> dict:
     """Enough about where this ran to tell two baselines apart. A baseline recorded
     somewhere else is not wrong, it is just about a different computer — `report.py`
-    says so rather than pretending the comparison is meaningful."""
+    says so rather than pretending the comparison is meaningful.
+
+    Deliberately coarse. Baselines are committed, and the package's one is published, so
+    this is a description of a *class* of machine, not a fingerprint of a particular
+    one: `platform.platform()` would put an exact kernel build and glibc version in a
+    public file, and neither of them moves a benchmark. The interpreter's minor version
+    does, so that is the only version kept."""
     return {
-        "python": platform.python_version(),
-        "platform": platform.platform(terse=True),
-        "processor": platform.processor() or platform.machine(),
+        "python": ".".join(platform.python_version_tuple()[:2]),
+        "platform": platform.system(),
+        "processor": platform.machine(),
     }
 
 

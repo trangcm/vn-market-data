@@ -2,8 +2,8 @@
  "suite": "vn-market-data",
  "recorded_at": "2026-08-08T08:00:02+00:00",
  "machine": {
-  "python": "3.10.12",
-  "platform": "Linux-6.8.0-136-generic-x86_64-with-glibc2.35",
+  "python": "3.10",
+  "platform": "Linux",
   "processor": "x86_64"
  },
  "tolerance": 1.5,
