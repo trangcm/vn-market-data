@@ -44,10 +44,17 @@ _BOARD_BATCH = 400
 _META_COLS = ("item", "item_en", "item_id")
 
 # ── Statement line items (exact English labels from VCI), keyed by a short alias ──
+# Sign conventions are VCI's own, passed through unchanged: costs, expenses, tax and
+# capex come back NEGATIVE; depreciation is the POSITIVE indirect-method add-back.
+# Callers take abs() where they want a magnitude.
 _INCOME = {
     "net_sales":         "Net sales",
+    "cost_of_sales":     "Cost of sales",
     "gross_profit":      "Gross Profit",
+    "interest_expense":  "Interest expenses",
     "operating_profit":  "Operating profit/(loss)",
+    "pretax_profit":     "Net accounting profit/(loss) before tax",
+    "tax":               "Corporate income tax expenses",
     "net_profit":        "Net profit/(loss) after tax",
     "net_profit_parent": "Attributable to parent company",
     "eps":               "EPS basic (VND)",
@@ -59,11 +66,22 @@ _BALANCE = {
     "st_borrowings":  "Short-term borrowings",
     "lt_borrowings":  "Long-term borrowings",
     "inventories":    "Inventories, Net",
+    "receivables":    "Accounts receivable",
+    "payables":       "Trade accounts payable",
+    # Fixed assets vs construction in progress: for a company mid-build the split
+    # says how much of the asset base is already earning. VCI also carries a legacy
+    # "Construction in progress (before 2015)" row that is all zeros — the live one
+    # is the unsuffixed label.
+    "fixed_assets":   "Fixed assets",
+    "cip":            "Construction in progress",
     "cash":           "Cash and cash equivalents",
+    "st_investments": "Short-term investments",
 }
 _CASHFLOW = {
     "operating_cash": "Net cash inflows/(outflows) from operating activities",
     "capex":          "Purchases of fixed assets and other long term assets",
+    "depreciation":   "Depreciation and amortization",
+    "dividends_paid": "Dividends paid",
 }
 # Bank variants — different statement structure entirely.
 _BANK_INCOME = {
