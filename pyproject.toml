@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vn-market-data"
-version = "0.1.1"
+version = "0.1.2"
 description = "Cache-first, source-abstracted market data for the Vietnamese stock market (HOSE/HNX/UPCOM)."
 readme = "README.md"
 license = { file = "LICENSE" }
