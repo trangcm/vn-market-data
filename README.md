@@ -199,9 +199,20 @@ python examples/diagnose_sources.py HPG   # which source answers, and do they ag
 python -m vn_market_data.benchmarks.bench_store   # timings above, on your machine
 ```
 
+The editable install is required rather than convenient: this repository's root *is* the
+package directory, so a bare `pytest` in a fresh clone reports
+`ModuleNotFoundError: vn_market_data`. The suite is 43 tests and passes without
+`vnstock` — the `[vci]` extra adds sources, not tests.
+
 If something is wrong, `diagnose_sources.py` is the first thing to run and the most
 useful thing to paste into an issue: it fetches the same symbol from every source in the
 chain and prints where they disagree.
+
+Patches are welcome, with one caveat worth knowing before you write one: this repository
+is a **one-way mirror** of a directory in a larger application, so a pull request opened
+here cannot be merged here — the change gets applied upstream with you credited, and
+ships in the next release. [`CONTRIBUTING.md`](CONTRIBUTING.md) explains what to do
+instead.
 
 ## License
 
