@@ -73,6 +73,7 @@ from vn_market_data.market_hours import (
     OPEN,
     fetch_due,
     last_session_close,
+    session_date,
     session_live,
 )
 from vn_market_data.sources.base import DataSource, NotSupported, SourceUnavailable
@@ -112,6 +113,7 @@ __all__ = [
     "session_live",
     "fetch_due",
     "last_session_close",
+    "session_date",
     "OPEN",
     "CLOSE",
     "ICT",

@@ -53,6 +53,23 @@ def last_session_close(now: datetime | None = None) -> datetime:
     raise AssertionError("unreachable: any 8-day window contains a weekday")
 
 
+def session_date(now: datetime | None = None) -> str:
+    """The trading session a *live* read (board, quote, intraday bar) belongs to,
+    as an ISO date.
+
+    Inside the session that is today; outside it, the last session that closed.
+    This is what dates a board snapshot, and it is deliberately **not** the same
+    as the newest date in a daily OHLCV feed: daily feeds only publish a session
+    after it closes, so during and just after a session the freshest candle is
+    still the *previous* one. Stamp each with its own date rather than assuming
+    they agree.
+    """
+    now = now or datetime.now(timezone.utc)
+    if session_live(now):
+        return now.astimezone(ICT).date().isoformat()
+    return last_session_close(now).date().isoformat()
+
+
 def fetch_due(last_ok: datetime | None, now: datetime | None = None) -> bool:
     """Whether a price-bearing fetch is worth making.
 
