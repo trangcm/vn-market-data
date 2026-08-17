@@ -16,11 +16,11 @@ every call after that is served from disk and only the new session's tail is fet
 Not on PyPI — install from the repository, at a tag:
 
 ```
-pip install "vn-market-data @ git+https://github.com/trangcm/vn-market-data@v0.1.1"
-pip install "vn-market-data[vci] @ git+https://github.com/trangcm/vn-market-data@v0.1.1"
+pip install "vn-market-data @ git+https://github.com/trangcm/vn-market-data@v0.1.2"
+pip install "vn-market-data[vci] @ git+https://github.com/trangcm/vn-market-data@v0.1.2"
 ```
 
-Pin the tag. Without `@v0.1.1` pip takes whatever the default branch happens to be at
+Pin the tag. Without `@v0.1.2` pip takes whatever the default branch happens to be at
 that moment, so the same command means something different tomorrow and an install
 cannot be reproduced. Releases never move a tag once it is pushed, so a pinned install
 is the one that stays what you tested against.
