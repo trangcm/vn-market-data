@@ -39,6 +39,17 @@ MEMBERS_TTL_S    = 24 * 3600   # index membership only moves at a quarterly revi
 # an outage anywhere in the day still answers with this session's own numbers.
 BOARD_STALE_S    = 6 * 3600
 
+# The band to test a candle series against when the symbol has never been boarded and its
+# own limit is unknown — the widest ordinary VN band (UPCOM). Deliberately the loosest of
+# them: a missed seam is repaired the next time the symbol *is* boarded, while a false one
+# refetches a whole history that was never wrong.
+DEFAULT_PRICE_BAND = 0.15
+# How far *before* the oldest candle held a seam repair starts. A source asked for a
+# multi-year window can answer from the day after the one requested (DNSE does), which
+# would leave the single oldest bar on the pre-adjustment scale and the seam merely moved
+# to the front of the series. A week of lead is free — the rows are refetched anyway.
+SEAM_REPAIR_LEAD_DAYS = 7
+
 _sources = None
 
 
@@ -90,7 +101,8 @@ def _query(method: str, *args, **kwargs):
 def get_ohlcv(symbol: str, lookback_days: int = 730, *,
               is_index: bool = False, ttl_s: float = OHLCV_TTL_S) -> list[dict]:
     """Daily OHLCV for one symbol, oldest-first, normalized to full VND (index unscaled).
-    Served from the store; only a cold cache or a stale tail (new trading day) hits a source."""
+    Served from the store; only a cold cache, a stale tail (new trading day) or a
+    corporate-action seam in the banked series hits a source."""
     symbol = symbol.strip().upper()
     if not symbol:
         return []
@@ -102,6 +114,7 @@ def get_ohlcv(symbol: str, lookback_days: int = 730, *,
         bounds = store.ohlcv_bounds(conn, symbol)
         fetch_from = None
         floor = None
+        band, repair = None, []
         if bounds is None:
             fetch_from = start                                   # cold cache → full backfill
         else:
@@ -115,13 +128,37 @@ def get_ohlcv(symbol: str, lookback_days: int = 730, *,
             floor = store.meta_floor(conn, symbol, "ohlcv") or min_d
             if start < floor:
                 fetch_from = start                               # need deeper history → refetch
-            elif (not store.meta_fresh(conn, symbol, "ohlcv", ttl_s)
-                  and end > max_d and today.weekday() < 5):
-                # Stale tail on a weekday → top up. All three conditions matter: without
-                # the TTL every call re-fetches, without `end > max_d` a symbol whose last
-                # candle is already today re-fetches all day, and without the weekday test
-                # every weekend call chases a session that will never print.
-                fetch_from = max_d
+            elif not store.meta_fresh(conn, symbol, "ohlcv", ttl_s):
+                if end > max_d and today.weekday() < 5:
+                    # Stale tail on a weekday → top up. All three conditions matter:
+                    # without the TTL every call re-fetches, without `end > max_d` a
+                    # symbol whose last candle is already today re-fetches all day, and
+                    # without the weekday test every weekend call chases a session that
+                    # will never print.
+                    fetch_from = max_d
+                # …but a tail top-up is exactly what a corporate action defeats. When one
+                # lands, the source rescales the symbol's *whole* history; appending the
+                # new bars in front of the old ones leaves a fall no exchange would have
+                # allowed, and it never heals, because every later call is a tail top-up
+                # too. So re-read what is banked and look for that seam: finding one means
+                # refetching everything held, not just the tail. Indices are exempt —
+                # they have no corporate actions and no price band to test against.
+                if not is_index:
+                    band = store.price_band(conn, symbol) or DEFAULT_PRICE_BAND
+                    seams = store.find_price_seams(conn, symbol, min_d, end, band)
+                    # Each seam is repaired at most once. Some moves beyond *today's*
+                    # band were genuinely traded — a symbol that has since changed
+                    # exchange met a wider band at the time — and those survive the
+                    # refetch, so without the ledger they would be chased every TTL for
+                    # as long as the symbol is cached.
+                    repair = [d for d in seams if d not in store.seams_repaired(conn, symbol)]
+                    if repair:
+                        oldest = (date.fromisoformat(min_d)
+                                  - timedelta(days=SEAM_REPAIR_LEAD_DAYS)).isoformat()
+                        fetch_from = min(start, oldest)
+                        log.warning("%s: price seam at %s beyond the ±%.0f%% band — "
+                                    "refetching %s..%s (corporate action?)",
+                                    symbol, ", ".join(repair), band * 100, fetch_from, end)
 
         if fetch_from is not None:
             try:
@@ -143,6 +180,8 @@ def get_ohlcv(symbol: str, lookback_days: int = 730, *,
                 # A tail top-up starts at max_d and must not raise the floor with it.
                 store.set_meta(conn, symbol, "ohlcv", src,
                                floor=min(fetch_from, floor) if floor else fetch_from)
+                if repair:
+                    store.mark_seams_repaired(conn, symbol, repair, band)
 
         return store.get_ohlcv_range(conn, symbol, start, end)
 

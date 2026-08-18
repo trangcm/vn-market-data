@@ -64,6 +64,7 @@ new source.
 | Cache is warm | Local read. No network. |
 | Cache is cold | Full backfill from the head source, written through. |
 | New trading day, weekday | Tail top-up only (not a refetch). |
+| A corporate action rescaled the history | Detected as a session move beyond the symbol's own price-limit band (read off the last board snapshot), and repaired by refetching every candle held — a tail top-up alone would leave the pre-adjustment bars in place forever. Each seam is tried **once**: a move that survives the refetch was really traded, and is remembered rather than chased. |
 | Deeper `lookback_days` than before | Refetch from the new floor, once. Asking *shallower* again is a local read. |
 | Listed after the window starts | Everything that exists, and that is the whole answer — not re-probed on every call. |
 | Weekend / holiday | Nothing is fetched — the session will never print. |

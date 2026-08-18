@@ -7,7 +7,7 @@ sub-millisecond). All figures are stored already-normalized (full VND; index uns
 — scaling is the source's job, so the store never has to know who answered.
 """
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 
 def _now() -> str:
@@ -86,6 +86,90 @@ def upsert_ohlcv(conn, symbol: str, rows: list[dict], source: str) -> None:
              close=excluded.close, volume=excluded.volume, source=excluded.source""",
         [(symbol, r["date"], r.get("open"), r.get("high"), r.get("low"),
           r.get("close"), r.get("volume"), source) for r in rows])
+    conn.commit()
+
+
+# ── Corporate-action seams (md_ohlcv sanity) ────────────────────────────────
+# Every VN exchange caps how far a price may move in one session — HOSE ±7%, HNX ±10%,
+# UPCOM ±15%, with wider first-day / post-suspension bands above those. A move beyond
+# the cap between two adjacent sessions was therefore never traded. It is the seam left
+# when a source back-adjusts a symbol's whole history for a corporate action while the
+# cache, which only ever tops up the tail, keeps the pre-adjustment bars in front of the
+# post-adjustment ones. Nothing downstream can tell that apart from a crash: it prints a
+# breakdown to pattern geometry, sinks the symbol's relative strength, and grades as a
+# real prediction. See `find_price_seam` for the detector and the adapter for the repair.
+_STD_BANDS = (0.07, 0.10, 0.15, 0.20, 0.30, 0.40)
+# Prices are stored to the tick, so a ratio can land a hair outside its band on rounding
+# alone. Small enough that the tightest real seam (a 5% cash dividend on HOSE) still
+# clears it by a wide margin.
+_SEAM_TOL = 0.005
+# Fri→Tue across a Monday holiday. Past that the two rows are not adjacent sessions, and
+# a week's move is not bounded by one session's band — so a gap is skipped, never flagged.
+_SEAM_MAX_GAP_DAYS = 4
+
+
+def price_band(conn, symbol: str) -> float | None:
+    """The symbol's own daily price-limit band, as a fraction, or None if never boarded.
+
+    Read off ceiling/floor against the reference price rather than mapped from an
+    exchange, so the package needs no listing table and stays right for a symbol that
+    changes exchange. Both edges are rounded to the tick *inside* the band, so the
+    implied figure always undershoots — it is snapped up to the nearest published band
+    and never used raw. An implied band wider than any of them is not a band at all
+    (a malformed snapshot); None sends the caller to its own default.
+    """
+    row = conn.execute(
+        """SELECT ceiling, floor, ref_price FROM md_board
+           WHERE symbol=? AND ref_price>0 ORDER BY ts DESC LIMIT 1""",
+        (symbol,)).fetchone()
+    if not row:
+        return None
+    edges = [abs(v / row["ref_price"] - 1.0) for v in (row["ceiling"], row["floor"]) if v]
+    if not edges:
+        return None
+    implied = max(edges)
+    return next((b for b in _STD_BANDS if implied <= b + 1e-9), None)
+
+
+def find_price_seams(conn, symbol: str, start: str, end: str, band: float) -> list[str]:
+    """Every date in ``start..end`` whose close sits further from the previous session's
+    than *band* allows, oldest first. Each is the later of the two dates — the first bar
+    on the new scale, i.e. where a repair has to reach back past to be complete.
+
+    All of them, not just the first: a symbol can carry a settled old move that no refetch
+    will change (see ``md_ohlcv_seams``), and returning only the earliest would let that
+    one mask every seam after it for good.
+    """
+    rows = conn.execute(
+        """SELECT date, close FROM md_ohlcv
+           WHERE symbol=? AND date>=? AND date<=? AND close>0 ORDER BY date""",
+        (symbol, start, end)).fetchall()
+    out, prev = [], None
+    for row in rows:
+        if prev is not None:
+            gap = (date.fromisoformat(row["date"]) - date.fromisoformat(prev["date"])).days
+            if (gap <= _SEAM_MAX_GAP_DAYS
+                    and abs(row["close"] / prev["close"] - 1.0) > band + _SEAM_TOL):
+                out.append(row["date"])
+        prev = row
+    return out
+
+
+def seams_repaired(conn, symbol: str) -> set[str]:
+    """Seam dates already refetched once for this symbol — never tried again."""
+    return {r["seam_date"] for r in conn.execute(
+        "SELECT seam_date FROM md_ohlcv_seams WHERE symbol=?", (symbol,))}
+
+
+def mark_seams_repaired(conn, symbol: str, dates: list[str], band: float) -> None:
+    """Record a repair attempt, whether or not it changed anything. A seam that survives
+    the refetch was really traded, and this is what stops it being chased forever."""
+    now = _now()
+    conn.executemany(
+        """INSERT INTO md_ohlcv_seams(symbol, seam_date, band, repaired_at)
+           VALUES (?,?,?,?)
+           ON CONFLICT(symbol, seam_date) DO UPDATE SET repaired_at=excluded.repaired_at""",
+        [(symbol, d, band, now) for d in dates])
     conn.commit()
 
 

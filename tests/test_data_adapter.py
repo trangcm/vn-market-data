@@ -10,12 +10,13 @@ module global. ``test_package_boundary.py`` enforces the other half of that.
 """
 import logging
 import sqlite3
+from contextlib import closing
 from datetime import date, timedelta
 
 import pytest
 
 import vn_market_data as vmd
-from vn_market_data import adapter
+from vn_market_data import adapter, store
 from vn_market_data.sources.base import DataSource, NotSupported, SourceUnavailable
 from vn_market_data.sources.registry import build_sources
 
@@ -332,6 +333,163 @@ def test_short_history_is_not_refetched_on_every_call(temp_db, monkeypatch):
     # But a genuinely deeper request is still a miss.
     adapter.get_ohlcv("NEW", lookback_days=365)
     assert src.calls[-1][0] == (_WED + timedelta(days=1) - timedelta(days=365)).isoformat()
+
+
+# ── DA-U-01: the corporate-action seam detector ──────────────────────────────
+# A tail top-up is blind to a source rescaling the history behind it: the old bars stay
+# on the old scale and the join prints a fall no exchange would have allowed. It never
+# heals on its own, because every later call tops up the tail too.
+
+
+def _seamed(d0, d1, *, scale, at):
+    """A flat run of candles carrying two different scales — the shape a
+    back-adjustment leaves behind when only the tail was refetched."""
+    rows = _rows_between(d0, d1)
+    for r in rows:
+        if r["date"] >= at:
+            for k in ("open", "high", "low", "close"):
+                r[k] = round(r[k] * scale, 2)
+    return rows
+
+
+def _bank(symbol, rows, board=None):
+    """Seed the store directly — these tests are about what the adapter does with
+    candles that are *already* banked, so nothing here should reach a source."""
+    with closing(vmd.connect()) as conn:
+        store.upsert_ohlcv(conn, symbol, rows, "seeded")
+        if board is not None:
+            store.insert_board(conn, {symbol: board}, "fake")
+
+
+def test_price_band_snaps_up_to_the_published_band(temp_db):
+    with closing(vmd.connect()) as conn:
+        # Ceiling and floor are rounded to the tick *inside* the band, so a HOSE symbol
+        # implies 6.8%, not 7% — taken raw it would flag every legal limit-up move.
+        store.insert_board(conn, {"MBB": {"ceiling": 21250.0, "floor": 18550.0,
+                                          "ref_price": 19900.0}}, "fake")
+        assert store.price_band(conn, "MBB") == 0.07
+        assert store.price_band(conn, "NEVER_BOARDED") is None
+
+
+def test_price_band_rejects_a_malformed_snapshot(temp_db):
+    with closing(vmd.connect()) as conn:
+        store.insert_board(conn, {"X": {"ceiling": 900.0, "floor": 10.0,
+                                        "ref_price": 100.0}}, "fake")
+        assert store.price_band(conn, "X") is None   # 800% is not a band → caller's default
+
+
+def test_find_price_seam_ignores_a_gap_in_the_series(temp_db):
+    """Two rows a fortnight apart are not adjacent sessions, and a fortnight's move is
+    not bounded by one session's band. Flagging it would refetch on missing data."""
+    rows = [{"date": "2026-07-01", "open": 100, "high": 100, "low": 100,
+             "close": 100.0, "volume": 1},
+            {"date": "2026-07-20", "open": 50, "high": 50, "low": 50,
+             "close": 50.0, "volume": 1}]
+    _bank("GAPPY", rows)
+    with closing(vmd.connect()) as conn:
+        assert store.find_price_seams(conn, "GAPPY", "2026-01-01", "2026-12-31", 0.07) == []
+
+
+def test_corporate_action_seam_forces_a_full_refetch(temp_db, monkeypatch, caplog):
+    """MBB, 2026-08-07: a 15% stock dividend plus a 10:1 rights issue rescaled the whole
+    history at source. The cache held 23,900 in front of 20,120 — a 15.8% fall on a
+    ±7% board. The repair has to reach every candle held, not the tail."""
+    _pin_today(monkeypatch, _WED)
+    _bank("MBB",
+          _seamed(_WED - timedelta(days=40), _WED - timedelta(days=1),
+                  scale=0.8, at=(_WED - timedelta(days=10)).isoformat()),
+          board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+
+    src = _RangeSrc(_seamed(_WED - timedelta(days=60), _WED,
+                            scale=0.8, at="1900-01-01"))     # source is fully adjusted
+    vmd.set_sources([src])
+
+    with caplog.at_level("WARNING"):
+        rows = adapter.get_ohlcv("MBB", lookback_days=30, ttl_s=0)
+
+    assert src.calls, "a seam must reach a source"
+    assert src.calls[-1][0] == (_WED - timedelta(days=40 + adapter.SEAM_REPAIR_LEAD_DAYS)
+                                ).isoformat(), (
+        "the refetch must start before the oldest candle held — a tail top-up, or even "
+        "the requested window, would leave earlier bars on the pre-adjustment scale, and "
+        "a source that answers from the day *after* the one asked for would leave the "
+        "oldest bar itself")
+    assert "price seam" in caplog.text
+    closes = [r["close"] for r in rows]
+    assert max(closes) / min(closes) < 1.07, "the seam must be gone after the repair"
+
+
+def test_a_seam_that_survives_the_refetch_is_never_chased_again(temp_db, monkeypatch):
+    """9% of the cached universe carries a move beyond *today's* band that was really
+    traded — a bank that has since moved from UPCOM to HOSE met ±15% at the time. The
+    source serves it back unchanged, so without a ledger of what has already been tried
+    the detector refetches those whole histories once per TTL, forever."""
+    _pin_today(monkeypatch, _WED)
+    banked = _seamed(_WED - timedelta(days=40), _WED,
+                     scale=0.8, at=(_WED - timedelta(days=10)).isoformat())
+    _bank("VAB", banked, board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+
+    src = _RangeSrc(banked)                       # the source agrees: this really traded
+    vmd.set_sources([src])
+
+    adapter.get_ohlcv("VAB", lookback_days=30, ttl_s=0)
+    assert len(src.calls) == 1, "the first sighting is worth one refetch"
+    adapter.get_ohlcv("VAB", lookback_days=30, ttl_s=0)
+    adapter.get_ohlcv("VAB", lookback_days=30, ttl_s=0)
+    assert len(src.calls) == 1, "and only one — the refetch already answered the question"
+
+
+def test_a_settled_seam_does_not_mask_a_later_one(temp_db, monkeypatch):
+    """The dangerous shape: a symbol carrying an old move no refetch will change, which
+    then has a real corporate action. Reporting only the earliest seam would leave the
+    new one permanently invisible behind the old one."""
+    _pin_today(monkeypatch, _WED)
+    banked = _seamed(_WED - timedelta(days=40), _WED,
+                     scale=0.8, at=(_WED - timedelta(days=30)).isoformat())
+    _bank("SHB", banked, board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+    src = _RangeSrc(banked)
+    vmd.set_sources([src])
+    adapter.get_ohlcv("SHB", lookback_days=30, ttl_s=0)     # old seam: tried, survives
+    assert len(src.calls) == 1
+
+    # Now a real action rescales the tail — a second seam, ten days back.
+    fresh = _seamed(_WED - timedelta(days=40), _WED,
+                    scale=0.5, at=(_WED - timedelta(days=10)).isoformat())
+    _bank("SHB", [r for r in fresh if r["date"] >= (_WED - timedelta(days=10)).isoformat()])
+    adapter.get_ohlcv("SHB", lookback_days=30, ttl_s=0)
+    assert len(src.calls) == 2, "the new seam must still be seen behind the settled one"
+
+
+def test_a_clean_series_is_not_refetched(temp_db, monkeypatch):
+    """The detector's whole cost falls on symbols that were never wrong, so it must be
+    silent on an ordinary series — including one that limit-moves every session."""
+    _pin_today(monkeypatch, _WED)
+    rows = _rows_between(_WED - timedelta(days=40), _WED)
+    px = 100.0
+    for r in rows:                              # +6.9% a day: legal on HOSE, every day
+        px *= 1.069
+        for k in ("open", "high", "low", "close"):
+            r[k] = round(px, 2)
+    _bank("RUNNER", rows,
+          board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+
+    src = _RangeSrc(rows)
+    vmd.set_sources([src])
+    adapter.get_ohlcv("RUNNER", lookback_days=30, ttl_s=0)
+    assert src.calls == [], "no missing history, no stale tail, no seam — no fetch"
+
+
+def test_index_series_is_never_seam_checked(temp_db, monkeypatch):
+    """VNINDEX has no corporate actions and no price band; a crash in the index is a
+    crash, and refetching two years of it would be a permanent cost for nothing."""
+    _pin_today(monkeypatch, _WED)
+    banked = _seamed(_WED - timedelta(days=40), _WED,
+                     scale=0.5, at=(_WED - timedelta(days=10)).isoformat())
+    _bank("VNINDEX", banked)
+    src = _RangeSrc(banked)
+    vmd.set_sources([src])
+    adapter.get_ohlcv("VNINDEX", lookback_days=30, is_index=True, ttl_s=0)
+    assert src.calls == []
 
 
 def test_ohlcv_degrades_to_banked_candles_when_every_source_is_down(temp_db, monkeypatch,
