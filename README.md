@@ -202,7 +202,7 @@ python -m vn_market_data.benchmarks.bench_store   # timings above, on your machi
 
 The editable install is required rather than convenient: this repository's root *is* the
 package directory, so a bare `pytest` in a fresh clone reports
-`ModuleNotFoundError: vn_market_data`. The suite is 43 tests and passes without
+`ModuleNotFoundError: vn_market_data`. The suite is 51 tests and passes without
 `vnstock` — the `[vci]` extra adds sources, not tests.
 
 If something is wrong, `diagnose_sources.py` is the first thing to run and the most
