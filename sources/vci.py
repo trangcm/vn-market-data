@@ -76,6 +76,13 @@ _BALANCE = {
     "cip":            "Construction in progress",
     "cash":           "Cash and cash equivalents",
     "st_investments": "Short-term investments",
+    # Par-value share capital, in VND. Divided by the 10,000 VND par that every
+    # listed Vietnamese issuer carries, it is a **point-in-time share count** —
+    # which the statements otherwise do not give, since the EPS line is per-period
+    # and blank for many issuers. "Common shares" rather than "Paid-in capital"
+    # because the two are equal wherever both are filed and only this one excludes
+    # preferred stock.
+    "share_capital":  "Common shares",
 }
 _CASHFLOW = {
     "operating_cash": "Net cash inflows/(outflows) from operating activities",
@@ -100,6 +107,8 @@ _BANK_BALANCE = {
     "equity":       "OWNER'S EQUITY",
     "loans":        "Loans and advances to customers, net",
     "deposits":     "Deposits from customers",
+    # Same figure under the name the bank template files it as (see _BALANCE).
+    "share_capital": "Charter capital",
 }
 
 # vnstock event titles are Vietnamese. Classify on lowercase substrings.

@@ -9,13 +9,15 @@ its public surface: ``set_sources`` and ``set_connection_factory``, never a monk
 module global. ``test_package_boundary.py`` enforces the other half of that.
 """
 import logging
+import json
 import sqlite3
+from contextlib import closing
 from datetime import date, timedelta
 
 import pytest
 
 import vn_market_data as vmd
-from vn_market_data import adapter
+from vn_market_data import adapter, store
 from vn_market_data.sources.base import DataSource, NotSupported, SourceUnavailable
 from vn_market_data.sources.registry import build_sources
 
@@ -334,6 +336,239 @@ def test_short_history_is_not_refetched_on_every_call(temp_db, monkeypatch):
     assert src.calls[-1][0] == (_WED + timedelta(days=1) - timedelta(days=365)).isoformat()
 
 
+# ── DA-U-01: the corporate-action seam detector ──────────────────────────────
+# A tail top-up is blind to a source rescaling the history behind it: the old bars stay
+# on the old scale and the join prints a fall no exchange would have allowed. It never
+# heals on its own, because every later call tops up the tail too.
+
+
+def _seamed(d0, d1, *, scale, at):
+    """A flat run of candles carrying two different scales — the shape a
+    back-adjustment leaves behind when only the tail was refetched."""
+    rows = _rows_between(d0, d1)
+    for r in rows:
+        if r["date"] >= at:
+            for k in ("open", "high", "low", "close"):
+                r[k] = round(r[k] * scale, 2)
+    return rows
+
+
+def _bank(symbol, rows, board=None):
+    """Seed the store directly — these tests are about what the adapter does with
+    candles that are *already* banked, so nothing here should reach a source."""
+    with closing(vmd.connect()) as conn:
+        store.upsert_ohlcv(conn, symbol, rows, "seeded")
+        if board is not None:
+            store.insert_board(conn, {symbol: board}, "fake")
+
+
+def test_price_band_snaps_up_to_the_published_band(temp_db):
+    with closing(vmd.connect()) as conn:
+        # Ceiling and floor are rounded to the tick *inside* the band, so a HOSE symbol
+        # implies 6.8%, not 7% — taken raw it would flag every legal limit-up move.
+        store.insert_board(conn, {"MBB": {"ceiling": 21250.0, "floor": 18550.0,
+                                          "ref_price": 19900.0}}, "fake")
+        assert store.price_band(conn, "MBB") == 0.07
+        assert store.price_band(conn, "NEVER_BOARDED") is None
+
+
+def test_price_band_rejects_a_malformed_snapshot(temp_db):
+    with closing(vmd.connect()) as conn:
+        store.insert_board(conn, {"X": {"ceiling": 900.0, "floor": 10.0,
+                                        "ref_price": 100.0}}, "fake")
+        assert store.price_band(conn, "X") is None   # 800% is not a band → caller's default
+
+
+def test_find_price_seam_ignores_a_gap_in_the_series(temp_db):
+    """Two rows a fortnight apart are not adjacent sessions, and a fortnight's move is
+    not bounded by one session's band. Flagging it would refetch on missing data."""
+    rows = [{"date": "2026-07-01", "open": 100, "high": 100, "low": 100,
+             "close": 100.0, "volume": 1},
+            {"date": "2026-07-20", "open": 50, "high": 50, "low": 50,
+             "close": 50.0, "volume": 1}]
+    _bank("GAPPY", rows)
+    with closing(vmd.connect()) as conn:
+        assert store.find_price_seams(conn, "GAPPY", "2026-01-01", "2026-12-31", 0.07) == []
+
+
+def test_corporate_action_seam_forces_a_full_refetch(temp_db, monkeypatch, caplog):
+    """MBB, 2026-08-07: a 15% stock dividend plus a 10:1 rights issue rescaled the whole
+    history at source. The cache held 23,900 in front of 20,120 — a 15.8% fall on a
+    ±7% board. The repair has to reach every candle held, not the tail."""
+    _pin_today(monkeypatch, _WED)
+    _bank("MBB",
+          _seamed(_WED - timedelta(days=40), _WED - timedelta(days=1),
+                  scale=0.8, at=(_WED - timedelta(days=10)).isoformat()),
+          board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+
+    src = _RangeSrc(_seamed(_WED - timedelta(days=60), _WED,
+                            scale=0.8, at="1900-01-01"))     # source is fully adjusted
+    vmd.set_sources([src])
+
+    with caplog.at_level("WARNING"):
+        rows = adapter.get_ohlcv("MBB", lookback_days=30, ttl_s=0)
+
+    assert src.calls, "a seam must reach a source"
+    assert src.calls[-1][0] == (_WED - timedelta(days=40 + adapter.SEAM_REPAIR_LEAD_DAYS)
+                                ).isoformat(), (
+        "the refetch must start before the oldest candle held — a tail top-up, or even "
+        "the requested window, would leave earlier bars on the pre-adjustment scale, and "
+        "a source that answers from the day *after* the one asked for would leave the "
+        "oldest bar itself")
+    assert "price seam" in caplog.text
+    closes = [r["close"] for r in rows]
+    assert max(closes) / min(closes) < 1.07, "the seam must be gone after the repair"
+
+
+def test_a_seam_that_survives_the_refetch_is_never_chased_again(temp_db, monkeypatch):
+    """9% of the cached universe carries a move beyond *today's* band that was really
+    traded — a bank that has since moved from UPCOM to HOSE met ±15% at the time. The
+    source serves it back unchanged, so without a ledger of what has already been tried
+    the detector refetches those whole histories once per TTL, forever."""
+    _pin_today(monkeypatch, _WED)
+    banked = _seamed(_WED - timedelta(days=40), _WED,
+                     scale=0.8, at=(_WED - timedelta(days=10)).isoformat())
+    _bank("VAB", banked, board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+
+    src = _RangeSrc(banked)                       # the source agrees: this really traded
+    vmd.set_sources([src])
+
+    adapter.get_ohlcv("VAB", lookback_days=30, ttl_s=0)
+    assert len(src.calls) == 1, "the first sighting is worth one refetch"
+    adapter.get_ohlcv("VAB", lookback_days=30, ttl_s=0)
+    adapter.get_ohlcv("VAB", lookback_days=30, ttl_s=0)
+    assert len(src.calls) == 1, "and only one — the refetch already answered the question"
+
+
+def test_a_settled_seam_does_not_mask_a_later_one(temp_db, monkeypatch):
+    """The dangerous shape: a symbol carrying an old move no refetch will change, which
+    then has a real corporate action. Reporting only the earliest seam would leave the
+    new one permanently invisible behind the old one."""
+    _pin_today(monkeypatch, _WED)
+    banked = _seamed(_WED - timedelta(days=40), _WED,
+                     scale=0.8, at=(_WED - timedelta(days=30)).isoformat())
+    _bank("SHB", banked, board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+    src = _RangeSrc(banked)
+    vmd.set_sources([src])
+    adapter.get_ohlcv("SHB", lookback_days=30, ttl_s=0)     # old seam: tried, survives
+    assert len(src.calls) == 1
+
+    # Now a real action rescales the tail — a second seam, ten days back.
+    fresh = _seamed(_WED - timedelta(days=40), _WED,
+                    scale=0.5, at=(_WED - timedelta(days=10)).isoformat())
+    _bank("SHB", [r for r in fresh if r["date"] >= (_WED - timedelta(days=10)).isoformat()])
+    adapter.get_ohlcv("SHB", lookback_days=30, ttl_s=0)
+    assert len(src.calls) == 2, "the new seam must still be seen behind the settled one"
+
+
+def test_a_clean_series_is_not_refetched(temp_db, monkeypatch):
+    """The detector's whole cost falls on symbols that were never wrong, so it must be
+    silent on an ordinary series — including one that limit-moves every session."""
+    _pin_today(monkeypatch, _WED)
+    rows = _rows_between(_WED - timedelta(days=40), _WED)
+    px = 100.0
+    for r in rows:                              # +6.9% a day: legal on HOSE, every day
+        px *= 1.069
+        for k in ("open", "high", "low", "close"):
+            r[k] = round(px, 2)
+    _bank("RUNNER", rows,
+          board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+
+    src = _RangeSrc(rows)
+    vmd.set_sources([src])
+    adapter.get_ohlcv("RUNNER", lookback_days=30, ttl_s=0)
+    assert src.calls == [], "no missing history, no stale tail, no seam — no fetch"
+
+
+def test_index_series_is_never_seam_checked(temp_db, monkeypatch):
+    """VNINDEX has no corporate actions and no price band; a crash in the index is a
+    crash, and refetching two years of it would be a permanent cost for nothing."""
+    _pin_today(monkeypatch, _WED)
+    banked = _seamed(_WED - timedelta(days=40), _WED,
+                     scale=0.5, at=(_WED - timedelta(days=10)).isoformat())
+    _bank("VNINDEX", banked)
+    src = _RangeSrc(banked)
+    vmd.set_sources([src])
+    adapter.get_ohlcv("VNINDEX", lookback_days=30, is_index=True, ttl_s=0)
+    assert src.calls == []
+
+
+# ── DA-U-01b: which repairs actually rewrote history ─────────────────────────
+# The ledger above records every *attempt*, and most attempts change nothing. Anything
+# derived from a rescaled series — a persisted pivot, a graded outcome — is denominated
+# in a scale that no longer exists, so the two cases have to be told apart after the
+# fact, from the data rather than from the flag.
+
+
+def test_a_repair_that_rescaled_the_history_is_reported(temp_db, monkeypatch):
+    _pin_today(monkeypatch, _WED)
+    _bank("MBB",
+          _seamed(_WED - timedelta(days=40), _WED - timedelta(days=1),
+                  scale=0.8, at=(_WED - timedelta(days=10)).isoformat()),
+          board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+    vmd.set_sources([_RangeSrc(_seamed(_WED - timedelta(days=60), _WED,
+                                       scale=0.8, at="1900-01-01"))])
+    adapter.get_ohlcv("MBB", lookback_days=30, ttl_s=0)
+
+    with closing(vmd.connect()) as conn:
+        got = store.rescaled_symbols(conn)
+    assert set(got) == {"MBB"}
+    assert got["MBB"]["seam_date"] == (_WED - timedelta(days=10)).isoformat(), (
+        "the reported date is the first bar on the new scale — what a holder of old "
+        "levels needs in order to know which of its rows are dead")
+    assert got["MBB"]["rescaled_at"]        # and when the scale changed under them
+
+
+def test_a_seam_that_really_traded_is_not_reported_as_a_rescale(temp_db, monkeypatch):
+    """The common case, and the one that makes this a data test rather than a flag
+    read: the ledger row looks identical to the one above. Only the series can say
+    the repair changed nothing, and here it didn't — so nothing derived is stale."""
+    _pin_today(monkeypatch, _WED)
+    banked = _seamed(_WED - timedelta(days=40), _WED,
+                     scale=0.8, at=(_WED - timedelta(days=10)).isoformat())
+    _bank("VAB", banked, board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+    vmd.set_sources([_RangeSrc(banked)])          # the source agrees: this really traded
+    adapter.get_ohlcv("VAB", lookback_days=30, ttl_s=0)
+
+    with closing(vmd.connect()) as conn:
+        assert store.seams_repaired(conn, "VAB"), "the attempt was made and recorded"
+        assert store.rescaled_symbols(conn) == {}, "but it rewrote nothing"
+
+
+def test_a_settled_seam_does_not_hide_a_later_rescale(temp_db, monkeypatch):
+    """A symbol can carry both: an old move no refetch will change, and a real action
+    after it. The surviving seam must not suppress the resolved one, or the symbol
+    whose levels are actually dead is the one that goes unreported."""
+    _pin_today(monkeypatch, _WED)
+    old_seam = (_WED - timedelta(days=30)).isoformat()
+    banked = _seamed(_WED - timedelta(days=40), _WED, scale=0.8, at=old_seam)
+    _bank("SHB", banked, board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+    vmd.set_sources([_RangeSrc(banked)])
+    adapter.get_ohlcv("SHB", lookback_days=30, ttl_s=0)          # survives
+
+    # A real action rescales the tail. The source carries the adjustment — and still
+    # carries the settled move, because that one really happened.
+    _bank("SHB", [r for r in _seamed(_WED - timedelta(days=40), _WED, scale=0.5,
+                                     at=(_WED - timedelta(days=10)).isoformat())
+                  if r["date"] >= (_WED - timedelta(days=10)).isoformat()])
+    vmd.set_sources([_RangeSrc(_seamed(_WED - timedelta(days=60), _WED,
+                                       scale=0.8, at=old_seam))])
+    adapter.get_ohlcv("SHB", lookback_days=30, ttl_s=0)
+
+    with closing(vmd.connect()) as conn:
+        got = store.rescaled_symbols(conn)
+    assert set(got) == {"SHB"}
+    assert got["SHB"]["seams"] == [(_WED - timedelta(days=10)).isoformat()], (
+        "only the seam that went away — the settled one is still in the series")
+
+
+def test_no_ledger_means_nothing_to_report(temp_db):
+    """A store that has never repaired anything must answer empty, not scan."""
+    _bank("QUIET", _rows_between(_WED - timedelta(days=10), _WED))
+    with closing(vmd.connect()) as conn:
+        assert store.rescaled_symbols(conn) == {}
+
+
 def test_ohlcv_degrades_to_banked_candles_when_every_source_is_down(temp_db, monkeypatch,
                                                                    caplog):
     """A warm store outlives an outage. Raising here would fail a whole pipeline pass —
@@ -460,3 +695,216 @@ def test_board_degrades_to_the_last_stored_snapshot(temp_db):
     # …but only within the staleness bound; past it the caller gets nothing and falls
     # back to candles knowingly, rather than being handed a day-old board as live.
     assert adapter.get_board(["HPG"], ttl_s=0, stale_ttl_s=0) == {}
+
+
+# ── DA-U-08: the statement archive ───────────────────────────────────────────
+
+class _StmtSrc(DataSource):
+    """A source with VCI's defining limitation: it answers with a fixed-width window
+    of the most recent periods and nothing earlier, however often it is asked."""
+
+    def __init__(self, window, *, kind="general", name="fake"):
+        self.name = name
+        self.window = window          # {label: revenue}
+        self.calls = 0
+
+    def get_statements(self, symbol, period="year"):
+        self.calls += 1
+        labels = sorted(self.window, reverse=True)
+        return {"kind": "general", "periods": labels,
+                "statements": {"income": {"net_sales": dict(self.window)},
+                               "balance": {}, "cashflow": {}},
+                "ratio_extra": {"P/E": 1.0}}
+
+
+def test_statement_archive_outgrows_the_fixed_source_window(temp_db):
+    """The bug this exists to prevent: md_statements is keyed (symbol, period), so a
+    4-period payload *replaces* the previous four. Fetch every day for a year and the
+    store still holds four — a quarterly series can never reach its own year-ago
+    comparable, which is what forces a YoY question to be answered as QoQ."""
+    src = _StmtSrc({"2025-Q3": 30, "2025-Q4": 40, "2026-Q1": 50, "2026-Q2": 60})
+    vmd.set_sources([src])
+    adapter.get_statements("DPR", "quarter")
+
+    # Two quarters later the source has moved its window on and dropped the oldest two.
+    src.window = {"2026-Q1": 50, "2026-Q2": 60, "2026-Q3": 70, "2026-Q4": 80}
+    adapter.get_statements("DPR", "quarter", ttl_s=0)
+
+    assert adapter.get_statements("DPR", "quarter")["periods"] == \
+        ["2026-Q4", "2026-Q3", "2026-Q2", "2026-Q1"], "the cache still mirrors the source"
+
+    history = adapter.get_statement_history("DPR", "quarter", ttl_s=1e9)
+    assert history["periods"] == ["2026-Q4", "2026-Q3", "2026-Q2", "2026-Q1",
+                                  "2025-Q4", "2025-Q3"]
+    revenue = history["statements"]["income"]["net_sales"]
+    assert revenue["2025-Q4"] == 40, "a period the source no longer serves survives"
+    assert revenue["2026-Q4"] == 80
+    # ...which is the whole point: Q4 now has the year-ago comparable it needs.
+    assert revenue["2026-Q4"] / revenue["2025-Q4"] == 2.0
+
+
+def test_statement_archive_prefers_the_restated_figure(temp_db):
+    """An audited annual supersedes the provisional one it restates: same label, later
+    fetch, new number. Banking must overwrite, not keep the first answer seen."""
+    src = _StmtSrc({"2025": 100})
+    vmd.set_sources([src])
+    adapter.get_statements("DPR", "year")
+    src.window = {"2025": 118}
+    adapter.get_statements("DPR", "year", ttl_s=0)
+
+    history = adapter.get_statement_history("DPR", "year", ttl_s=1e9)
+    assert history["periods"] == ["2025"]
+    assert history["statements"]["income"]["net_sales"]["2025"] == 118
+
+
+def test_statement_archive_carries_live_ratio_extra_but_banks_none_of_it(temp_db):
+    """ratio_extra is trailing-twelve-month, not a property of any labelled period, so
+    archiving it per period would date-stamp a figure that has no date."""
+    vmd.set_sources([_StmtSrc({"2025": 100})])
+    adapter.get_statements("DPR", "year")
+    with closing(vmd.connect()) as conn:
+        banked = json.loads(conn.execute(
+            "SELECT payload FROM md_statement_periods WHERE symbol='DPR'").fetchone()[0])
+    assert set(banked) == {"income"} and "ratio_extra" not in banked
+    assert adapter.get_statement_history("DPR", "year", ttl_s=1e9)["ratio_extra"] == {"P/E": 1.0}
+
+
+def test_no_statements_banks_nothing(temp_db):
+    """A negative cache records that a symbol has no statements. Absence is not a
+    period, so it must not become an archive row that later reads as real."""
+    class _None(DataSource):
+        name = "fake"
+        def get_statements(self, symbol, period="year"):
+            return None
+
+    vmd.set_sources([_None()])
+    assert adapter.get_statements("XXX", "year") is None
+    assert adapter.banked_periods("XXX", "year") == []
+    assert adapter.get_statement_history("XXX", "year") is None
+
+
+def test_banked_periods_never_touches_a_source(temp_db):
+    """The quarterly gate asks this before deciding to spend a fetch, so it has to be
+    answerable from the store alone — otherwise the gate costs what it saves."""
+    src = _StmtSrc({"2026-Q1": 50, "2026-Q2": 60})
+    vmd.set_sources([src])
+    adapter.get_statements("DPR", "quarter")
+    calls = src.calls
+    assert adapter.banked_periods("DPR", "quarter") == ["2026-Q2", "2026-Q1"]
+    assert adapter.banked_periods("DPR", "year") == []
+    assert src.calls == calls
+
+
+def test_a_live_cache_is_backfilled_into_the_archive_once(temp_db):
+    """A store that has been running for months is already holding periods the source
+    may have stopped serving, and the next TTL expiry overwrites them. They cost no
+    fetch to keep, so init_schema banks them — once per (symbol, period), never
+    re-deriving a pair the normal path has already banked."""
+    payload = {"kind": "general", "periods": ["2023", "2022"],
+               "statements": {"income": {"net_sales": {"2023": 10, "2022": 9}},
+                              "balance": {}, "cashflow": {}},
+               "ratio_extra": {}}
+    with closing(vmd.connect()) as conn:
+        conn.execute("INSERT INTO md_statements(symbol, period, payload, source, fetched_at) "
+                     "VALUES ('DPR','year',?, 'vci', '2026-01-01T00:00:00Z')",
+                     (json.dumps(payload),))
+        conn.execute("INSERT INTO md_statements(symbol, period, payload, source, fetched_at) "
+                     "VALUES ('XXX','year', NULL, 'vci', '2026-01-01T00:00:00Z')")
+        conn.commit()
+        vmd.init_schema(conn)
+        assert store.banked_labels(conn, "DPR", "year") == ["2023", "2022"]
+        assert store.banked_labels(conn, "XXX", "year") == [], \
+            "a negative cache carries no period to bank"
+
+        # A pair the normal path has since moved on is not dragged back to the cache's
+        # copy on the next startup.
+        conn.execute("UPDATE md_statement_periods SET payload=? WHERE label='2023'",
+                     (json.dumps({"income": {"net_sales": 11}}),))
+        conn.commit()
+        vmd.init_schema(conn)
+        assert json.loads(conn.execute(
+            "SELECT payload FROM md_statement_periods WHERE label='2023'"
+        ).fetchone()[0])["income"]["net_sales"] == 11
+
+
+# ── DA-U-04: unsettled same-session bars ─────────────────────────────────────
+# A daily feed that answers with the day still in progress returns a bar truncated to
+# the first minutes of trading. `upsert_ohlcv` withholds those rather than banking a
+# figure that later changes underneath every consumer of the store.
+
+def _settled_rows(n, *, volume=1_000_000, end_offset=1):
+    """`n` bars ending `end_offset` days before today — settled history by definition."""
+    first = date.today() - timedelta(days=n + end_offset - 1)
+    return [{"date": (first + timedelta(days=i)).isoformat(),
+             "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+             "volume": float(volume)} for i in range(n)]
+
+
+def _today_row(volume, close=100.0):
+    return {"date": date.today().isoformat(), "open": 100.0, "high": 100.5,
+            "low": 99.5, "close": close, "volume": float(volume)}
+
+
+def _banked(symbol):
+    with closing(vmd.connect()) as conn:
+        return {r["date"]: r["volume"] for r in conn.execute(
+            "SELECT date, volume FROM md_ohlcv WHERE symbol=?", (symbol,))}
+
+
+def test_upsert_withholds_a_truncated_bar_for_today(temp_db, caplog):
+    """The 2026-08-28 shape: ~1% of the symbol's own recent volume, dated today."""
+    rows = _settled_rows(20) + [_today_row(9_000)]     # 0.9% of a 1,000,000 median
+    with closing(vmd.connect()) as conn, caplog.at_level(logging.WARNING):
+        store.upsert_ohlcv(conn, "SHB", rows, "fake")
+
+    banked = _banked("SHB")
+    assert date.today().isoformat() not in banked, "a truncated bar must not be banked"
+    assert len(banked) == 20, "the settled history around it is banked as given"
+    assert "unsettled" in caplog.text.lower()
+
+
+def test_upsert_banks_a_normal_bar_for_today(temp_db):
+    """The guard is about truncation, not about today — a full session banks normally."""
+    rows = _settled_rows(20) + [_today_row(800_000)]
+    with closing(vmd.connect()) as conn:
+        store.upsert_ohlcv(conn, "HPG", rows, "fake")
+    assert _banked("HPG")[date.today().isoformat()] == 800_000
+
+
+def test_upsert_banks_a_thin_settled_session(temp_db):
+    """Low volume alone proves nothing: 0.8% of real settled bars in the live store sit
+    below the threshold, and those are true. Only *today* is ever withheld."""
+    thin = _settled_rows(1, volume=9_000, end_offset=1)     # yesterday, 0.9% of median
+    rows = _settled_rows(20, end_offset=2) + thin
+    with closing(vmd.connect()) as conn:
+        store.upsert_ohlcv(conn, "SCR", rows, "fake")
+    assert _banked("SCR")[thin[0]["date"]] == 9_000
+
+
+def test_upsert_banks_todays_bar_when_there_is_no_baseline(temp_db):
+    """A new listing has nothing to be measured against, so it is banked as given —
+    the check states what it cannot see rather than guessing."""
+    rows = _settled_rows(4) + [_today_row(9_000)]
+    with closing(vmd.connect()) as conn:
+        store.upsert_ohlcv(conn, "NEWCO", rows, "fake")
+    assert _banked("NEWCO")[date.today().isoformat()] == 9_000
+
+
+def test_a_withheld_bar_is_banked_once_the_feed_settles_it(temp_db):
+    """Withholding costs latency, never data: the next pass carries the real bar."""
+    today = date.today().isoformat()
+    with closing(vmd.connect()) as conn:
+        store.upsert_ohlcv(conn, "VIX", _settled_rows(20) + [_today_row(9_000)], "fake")
+        assert today not in _banked("VIX")
+        store.upsert_ohlcv(conn, "VIX", [_today_row(1_200_000)], "fake")
+    assert _banked("VIX")[today] == 1_200_000
+
+
+def test_a_cold_backfill_measures_against_its_own_rows(temp_db):
+    """Nothing is banked yet on a first fetch, so the baseline has to come from the
+    payload itself — otherwise the very first write is the one that gets through."""
+    src = _Src("fake", ohlcv=_settled_rows(30) + [_today_row(9_000)])
+    vmd.set_sources([src])
+    served = adapter.get_ohlcv("LPB", lookback_days=60)
+    assert date.today().isoformat() not in {r["date"] for r in served}
+    assert len(served) == 30

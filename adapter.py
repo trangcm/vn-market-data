@@ -39,6 +39,17 @@ MEMBERS_TTL_S    = 24 * 3600   # index membership only moves at a quarterly revi
 # an outage anywhere in the day still answers with this session's own numbers.
 BOARD_STALE_S    = 6 * 3600
 
+# The band to test a candle series against when the symbol has never been boarded and its
+# own limit is unknown — the widest ordinary VN band (UPCOM). Deliberately the loosest of
+# them: a missed seam is repaired the next time the symbol *is* boarded, while a false one
+# refetches a whole history that was never wrong.
+DEFAULT_PRICE_BAND = 0.15
+# How far *before* the oldest candle held a seam repair starts. A source asked for a
+# multi-year window can answer from the day after the one requested (DNSE does), which
+# would leave the single oldest bar on the pre-adjustment scale and the seam merely moved
+# to the front of the series. A week of lead is free — the rows are refetched anyway.
+SEAM_REPAIR_LEAD_DAYS = 7
+
 _sources = None
 
 
@@ -90,7 +101,8 @@ def _query(method: str, *args, **kwargs):
 def get_ohlcv(symbol: str, lookback_days: int = 730, *,
               is_index: bool = False, ttl_s: float = OHLCV_TTL_S) -> list[dict]:
     """Daily OHLCV for one symbol, oldest-first, normalized to full VND (index unscaled).
-    Served from the store; only a cold cache or a stale tail (new trading day) hits a source."""
+    Served from the store; only a cold cache, a stale tail (new trading day) or a
+    corporate-action seam in the banked series hits a source."""
     symbol = symbol.strip().upper()
     if not symbol:
         return []
@@ -102,6 +114,7 @@ def get_ohlcv(symbol: str, lookback_days: int = 730, *,
         bounds = store.ohlcv_bounds(conn, symbol)
         fetch_from = None
         floor = None
+        band, repair = None, []
         if bounds is None:
             fetch_from = start                                   # cold cache → full backfill
         else:
@@ -115,13 +128,37 @@ def get_ohlcv(symbol: str, lookback_days: int = 730, *,
             floor = store.meta_floor(conn, symbol, "ohlcv") or min_d
             if start < floor:
                 fetch_from = start                               # need deeper history → refetch
-            elif (not store.meta_fresh(conn, symbol, "ohlcv", ttl_s)
-                  and end > max_d and today.weekday() < 5):
-                # Stale tail on a weekday → top up. All three conditions matter: without
-                # the TTL every call re-fetches, without `end > max_d` a symbol whose last
-                # candle is already today re-fetches all day, and without the weekday test
-                # every weekend call chases a session that will never print.
-                fetch_from = max_d
+            elif not store.meta_fresh(conn, symbol, "ohlcv", ttl_s):
+                if end > max_d and today.weekday() < 5:
+                    # Stale tail on a weekday → top up. All three conditions matter:
+                    # without the TTL every call re-fetches, without `end > max_d` a
+                    # symbol whose last candle is already today re-fetches all day, and
+                    # without the weekday test every weekend call chases a session that
+                    # will never print.
+                    fetch_from = max_d
+                # …but a tail top-up is exactly what a corporate action defeats. When one
+                # lands, the source rescales the symbol's *whole* history; appending the
+                # new bars in front of the old ones leaves a fall no exchange would have
+                # allowed, and it never heals, because every later call is a tail top-up
+                # too. So re-read what is banked and look for that seam: finding one means
+                # refetching everything held, not just the tail. Indices are exempt —
+                # they have no corporate actions and no price band to test against.
+                if not is_index:
+                    band = store.price_band(conn, symbol) or DEFAULT_PRICE_BAND
+                    seams = store.find_price_seams(conn, symbol, min_d, end, band)
+                    # Each seam is repaired at most once. Some moves beyond *today's*
+                    # band were genuinely traded — a symbol that has since changed
+                    # exchange met a wider band at the time — and those survive the
+                    # refetch, so without the ledger they would be chased every TTL for
+                    # as long as the symbol is cached.
+                    repair = [d for d in seams if d not in store.seams_repaired(conn, symbol)]
+                    if repair:
+                        oldest = (date.fromisoformat(min_d)
+                                  - timedelta(days=SEAM_REPAIR_LEAD_DAYS)).isoformat()
+                        fetch_from = min(start, oldest)
+                        log.warning("%s: price seam at %s beyond the ±%.0f%% band — "
+                                    "refetching %s..%s (corporate action?)",
+                                    symbol, ", ".join(repair), band * 100, fetch_from, end)
 
         if fetch_from is not None:
             try:
@@ -143,6 +180,8 @@ def get_ohlcv(symbol: str, lookback_days: int = 730, *,
                 # A tail top-up starts at max_d and must not raise the floor with it.
                 store.set_meta(conn, symbol, "ohlcv", src,
                                floor=min(fetch_from, floor) if floor else fetch_from)
+                if repair:
+                    store.mark_seams_repaired(conn, symbol, repair, band)
 
         return store.get_ohlcv_range(conn, symbol, start, end)
 
@@ -254,7 +293,90 @@ def get_statements(symbol: str, period: str = "year", *,
             return payload
         src, payload = _query("get_statements", symbol, period)
         store.upsert_statements(conn, symbol, period, payload, src)  # None → negative cache
+        store.bank_statement_periods(conn, symbol, period, payload, src)
         return payload
+
+
+def banked_periods(symbol: str, period: str = "year") -> list[str]:
+    """Period labels already archived for this symbol, newest first — a store-only
+    read that touches no source. Lets a caller decide whether a fetch could even
+    return something it does not already have."""
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return []
+    with closing(connect()) as conn:
+        return store.banked_labels(conn, symbol, period)
+
+
+def banked_fetched_at(symbol: str, period: str = "year") -> str | None:
+    """When this symbol's statement archive was last written — a store-only read that
+    touches no source. See :func:`vn_market_data.store.banked_fetched_at`."""
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return None
+    with closing(connect()) as conn:
+        return store.banked_fetched_at(conn, symbol, period)
+
+
+def get_banked_statements(symbol: str, period: str = "year", *,
+                          max_periods: int | None = None) -> dict | None:
+    """The archive alone, newest period first — **no source is ever contacted**.
+
+    :func:`get_statement_history` refreshes through the cache before answering, which
+    means it can spend the source's quota when a symbol has no cache row yet. A caller
+    that only wants what is already banked — and whose freshness is governed elsewhere,
+    the way the quarterly archive's is by its own gated banking pass — needs a read
+    that cannot fetch at all, so an outage or a tripped quota degrades it to "nothing
+    banked yet" rather than to an error.
+
+    ``ratio_extra`` is carried from the *cached* payload rather than the archive,
+    which holds none: those figures (a bank's NPL/CASA/CAR) are already trailing
+    rather than per-period, so there is nothing to bank per period. Reading them from
+    the cache keeps this fetch-free — an absent or expired cache row simply yields
+    ``{}``, the same as before.
+    """
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return None
+    with closing(connect()) as conn:
+        history = store.get_statement_history(conn, symbol, period, max_periods)
+        if history is None:
+            return None
+        # ttl_s=inf: accept whatever is cached at any age, and never fetch. Freshness
+        # here is the banking pass's responsibility, not this read's.
+        _, cached = store.get_statements(conn, symbol, period, float("inf"))
+        history["ratio_extra"] = (cached or {}).get("ratio_extra", {}) or {}
+        return history
+
+
+def get_statement_history(symbol: str, period: str = "year", *,
+                          max_periods: int | None = None,
+                          ttl_s: float = STATEMENTS_TTL_S) -> dict | None:
+    """Statements over every period ever banked for this symbol, newest first.
+
+    Same shape as :func:`get_statements`, but reaching past the fixed window a source
+    returns: VCI serves only the latest four periods, so a quarterly series read from
+    it alone can never contain its own year-ago comparable no matter how often it is
+    fetched. This refreshes through the normal cache first — so the current period is
+    as fresh as ``get_statements`` would give — then answers from the archive that
+    every fetch has been filling.
+
+    Falls back to the live payload when nothing is banked yet (a cold archive is
+    narrower, never empty), and carries the live ``ratio_extra`` through, since the
+    archive deliberately holds no TTM figures.
+    """
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return None
+    live = get_statements(symbol, period, ttl_s=ttl_s)
+    with closing(connect()) as conn:
+        history = store.get_statement_history(conn, symbol, period, max_periods)
+    if history is None:
+        return live
+    if live:
+        history["kind"] = live.get("kind") or history["kind"]
+        history["ratio_extra"] = live.get("ratio_extra", {})
+    return history
 
 
 # ── Events ────────────────────────────────────────────────────────────────────

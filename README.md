@@ -16,11 +16,11 @@ every call after that is served from disk and only the new session's tail is fet
 Not on PyPI — install from the repository, at a tag:
 
 ```
-pip install "vn-market-data @ git+https://github.com/trangcm/vn-market-data@v0.1.2"
-pip install "vn-market-data[vci] @ git+https://github.com/trangcm/vn-market-data@v0.1.2"
+pip install "vn-market-data @ git+https://github.com/trangcm/vn-market-data@v0.2.0"
+pip install "vn-market-data[vci] @ git+https://github.com/trangcm/vn-market-data@v0.2.0"
 ```
 
-Pin the tag. Without `@v0.1.2` pip takes whatever the default branch happens to be at
+Pin the tag. Without `@v0.2.0` pip takes whatever the default branch happens to be at
 that moment, so the same command means something different tomorrow and an install
 cannot be reproduced. Releases never move a tag once it is pushed, so a pinned install
 is the one that stays what you tested against.
@@ -64,6 +64,7 @@ new source.
 | Cache is warm | Local read. No network. |
 | Cache is cold | Full backfill from the head source, written through. |
 | New trading day, weekday | Tail top-up only (not a refetch). |
+| A corporate action rescaled the history | Detected as a session move beyond the symbol's own price-limit band (read off the last board snapshot), and repaired by refetching every candle held — a tail top-up alone would leave the pre-adjustment bars in place forever. Each seam is tried **once**: a move that survives the refetch was really traded, and is remembered rather than chased. |
 | Deeper `lookback_days` than before | Refetch from the new floor, once. Asking *shallower* again is a local read. |
 | Listed after the window starts | Everything that exists, and that is the whole answer — not re-probed on every call. |
 | Weekend / holiday | Nothing is fetched — the session will never print. |
@@ -94,6 +95,8 @@ get_index_live(symbol) -> dict | None            # in-progress index candle; unc
 get_market_turnover(index="VNINDEX", lookback_days=420) -> list[dict]
 get_board(symbols, *, ttl_s=..., stale_ttl_s=...) -> dict[str, dict]
 get_statements(symbol, period="year", *, ttl_s=...) -> dict | None
+get_statement_history(symbol, period="year", *, max_periods=None, ttl_s=...) -> dict | None
+banked_periods(symbol, period="year") -> list[str]   # store-only; touches no source
 get_events(symbol, *, ttl_s=...) -> list[dict]   # dividends / corporate actions
 get_index_constituents(group="VN30", *, ttl_s=...) -> list[str]
 ```
@@ -105,6 +108,20 @@ different cadence overrides it per call rather than reaching into the module.
 per session — matched **plus** put-through (thoả thuận) — which is the "GTGD" figure
 every terminal quotes. Summing a price board over the whole exchange lands 15–20% short
 of it, because block deals agreed off the order book never touch the board.
+
+`get_statement_history` is the other one to know about, because it does something the
+source cannot. VCI answers `get_statements` with the latest **four** periods and no more,
+and the cache holds exactly what the source returned — so fetching quarterly statements
+every week for a year still leaves you with four quarters, and a quarterly series that
+can never contain its own year-ago comparable. Every fetch therefore also banks each
+period it saw as its own row, and `get_statement_history` reads across those: the window
+grows with the number of passes rather than staying fixed at the source's. It refreshes
+through the normal cache first, so the current period is exactly as fresh as
+`get_statements` would give, and falls back to the live payload while the archive is
+still cold. Two things it deliberately does not do: `ratio_extra` is not archived (it is
+trailing-twelve-month, not a property of a labelled period, so a per-period row would
+date-stamp a figure that has no date), and nothing is back-filled from before you started
+— history only reachable forward has to be started before it is needed.
 
 ## Sources
 
@@ -142,6 +159,12 @@ set_connection_factory(my_app.connect)   # zero-arg callable → sqlite3.Connect
 with my_app.connect() as conn:
     init_schema(conn)                    # idempotent; call once at startup
 ```
+
+`init_schema` also does one piece of data repair, not just schema: any `(symbol, period)`
+already in the statements cache but absent from the statement archive is banked from what
+the cache is holding. That is a one-shot per pair and costs no fetch — an existing cache
+carries periods the source may already have stopped serving, and they are lost the first
+time their TTL expires.
 
 The package borrows a connection, uses it, and closes it — your application keeps
 ownership of the path, the pragmas and the lifecycle. This matters more than it sounds:
@@ -199,9 +222,20 @@ python examples/diagnose_sources.py HPG   # which source answers, and do they ag
 python -m vn_market_data.benchmarks.bench_store   # timings above, on your machine
 ```
 
+The editable install is required rather than convenient: this repository's root *is* the
+package directory, so a bare `pytest` in a fresh clone reports
+`ModuleNotFoundError: vn_market_data`. The suite is 51 tests and passes without
+`vnstock` — the `[vci]` extra adds sources, not tests.
+
 If something is wrong, `diagnose_sources.py` is the first thing to run and the most
 useful thing to paste into an issue: it fetches the same symbol from every source in the
 chain and prints where they disagree.
+
+Patches are welcome, with one caveat worth knowing before you write one: this repository
+is a **one-way mirror** of a directory in a larger application, so a pull request opened
+here cannot be merged here — the change gets applied upstream with you credited, and
+ships in the next release. [`CONTRIBUTING.md`](CONTRIBUTING.md) explains what to do
+instead.
 
 ## License
 

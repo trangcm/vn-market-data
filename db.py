@@ -9,6 +9,7 @@ With no factory installed a default one opens ``$VN_MARKET_DATA_DB`` (or
 ``./vn_market_data.db``) and creates the schema on first use, so a bare
 ``pip install`` works with no setup at all.
 """
+import json
 import os
 import sqlite3
 import threading
@@ -80,6 +81,33 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _backfill_statement_archive(conn: sqlite3.Connection) -> None:
+    """Bank the periods a live `md_statements` cache is already holding.
+
+    Not a schema migration but a data one, and it belongs here because the evidence is
+    *perishable*. `md_statements` keeps one row per (symbol, period) carrying whatever
+    window the source last returned; the next fetch replaces it. So a cache that has
+    been running for months is holding periods the source may no longer serve, and
+    every one of them is lost the first time its TTL expires. Copying them into the
+    archive costs no fetch and buys back history that cannot be re-obtained.
+
+    Scoped to (symbol, period) pairs with *no* archive rows, so it is a one-shot per
+    pair rather than work on every startup, and a pair banked normally is never
+    re-derived from the cache.
+    """
+    from vn_market_data import store            # local: store must not import db back
+    pairs = conn.execute(
+        """SELECT s.symbol, s.period, s.payload, s.source FROM md_statements s
+           WHERE s.payload IS NOT NULL AND NOT EXISTS (
+               SELECT 1 FROM md_statement_periods p
+                WHERE p.symbol = s.symbol AND p.period = s.period)""").fetchall()
+    for symbol, period, payload, source in pairs:   # positional: a host's row factory
+        try:                                        # need not be sqlite3.Row
+            store.bank_statement_periods(conn, symbol, period, json.loads(payload), source)
+        except (TypeError, ValueError):
+            continue                                # a payload we cannot read is not a period
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Columns added after a table already existed — `CREATE TABLE IF NOT EXISTS`
     will not add them to a live table, so they go here."""
@@ -98,3 +126,5 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # which is the old behaviour — so an existing cache re-probes each symbol once
         # and records its answer.
         conn.execute("ALTER TABLE md_fetch_meta ADD COLUMN floor TEXT")
+
+    _backfill_statement_archive(conn)

@@ -54,6 +54,25 @@ CREATE TABLE IF NOT EXISTS md_statements (
     PRIMARY KEY (symbol, period)
 );
 
+-- The *archive* behind md_statements. That table is a cache: one row per
+-- (symbol, period) holding whatever window the source last returned — and VCI
+-- returns only the latest 4 — so every fetch overwrites the previous four and no
+-- history can ever accumulate. Banking each period as its own row is what turns a
+-- fixed 4-period window into a growing one: after a year of passes a quarterly
+-- series has its own year-ago comparable, which the source alone will never give.
+-- A later fetch of the same label wins (an audited annual supersedes the
+-- provisional one it restates). `ratio_extra` is deliberately not archived — it is
+-- trailing-twelve-month, not a property of the labelled period.
+CREATE TABLE IF NOT EXISTS md_statement_periods (
+    symbol  TEXT NOT NULL,
+    period  TEXT NOT NULL,                        -- 'year' | 'quarter' (the cadence)
+    label   TEXT NOT NULL,                        -- '2025' | '2026-Q2' (the period)
+    kind    TEXT,                                 -- 'general' | 'bank'
+    payload TEXT NOT NULL,                        -- JSON {income,balance,cashflow} for this label
+    source  TEXT NOT NULL, fetched_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, period, label)
+);
+
 -- Dividend/corporate-action events, replace-all per symbol on refresh.
 CREATE TABLE IF NOT EXISTS md_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,4 +93,22 @@ CREATE TABLE IF NOT EXISTS md_fetch_meta (
     source     TEXT NOT NULL,
     floor      TEXT,                        -- oldest date ever *asked* for (ohlcv only)
     PRIMARY KEY (symbol, kind)
+);
+
+-- One row per corporate-action seam the adapter has already tried to repair. A seam is
+-- a session move beyond the symbol's price band (see store.find_price_seams): usually
+-- the mark left when a source rescales a symbol's history and the cache, which only tops
+-- up the tail, keeps the pre-adjustment bars in front of the new ones. Refetching every
+-- candle held repairs that. But some moves beyond *today's* band were genuinely traded —
+-- a symbol that has since changed exchange met a wider band at the time, and so does a
+-- first session or one resuming after a long suspension. Those survive the refetch, and
+-- without this table the detector would refetch their whole history once per TTL forever.
+-- So each (symbol, seam_date) is repaired at most once, and a settled old seam never
+-- masks a new one.
+CREATE TABLE IF NOT EXISTS md_ohlcv_seams (
+    symbol      TEXT NOT NULL,
+    seam_date   TEXT NOT NULL,              -- first bar on the new scale
+    band        REAL,                       -- the band it was judged against
+    repaired_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, seam_date)
 );

@@ -58,6 +58,8 @@ from vn_market_data.adapter import (
     get_market_turnover,
     get_ohlcv,
     get_sources,
+    banked_periods,
+    get_statement_history,
     get_statements,
     set_sources,
 )
@@ -73,6 +75,7 @@ from vn_market_data.market_hours import (
     OPEN,
     fetch_due,
     last_session_close,
+    session_date,
     session_live,
 )
 from vn_market_data.sources.base import DataSource, NotSupported, SourceUnavailable
@@ -81,7 +84,10 @@ from vn_market_data.sources.registry import build_sources
 from vn_market_data.sources.vci import VCISource, vnstock_installed
 from vn_market_data.sources.vndirect import VNDirectSource
 
-__version__ = "0.1.0"
+# Kept in step with pyproject.toml by the release script, which is the only thing that
+# knows what version is being cut. It drifted three releases behind while the release
+# repinned the README and nothing repinned this.
+__version__ = "0.2.0"
 
 __all__ = [
     # reads
@@ -90,6 +96,8 @@ __all__ = [
     "get_market_turnover",
     "get_board",
     "get_statements",
+    "get_statement_history",
+    "banked_periods",
     "get_events",
     "get_index_constituents",
     # storage
@@ -112,6 +120,7 @@ __all__ = [
     "session_live",
     "fetch_due",
     "last_session_close",
+    "session_date",
     "OPEN",
     "CLOSE",
     "ICT",

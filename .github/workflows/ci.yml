@@ -1,0 +1,110 @@
+# CI for the *published* repo. This file lives under the subtree prefix in the upstream
+# monorepo, so it arrives here as `.github/workflows/ci.yml` after `git subtree split`.
+# Editing it here is pointless — see CONTRIBUTING.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 3.10 is the floor the package declares (PEP 604 unions, an assignment expression in
+  # a comprehension); 3.12 is what it is developed on. Testing the ends catches the
+  # syntax-floor mistakes without paying for every version in between.
+  #
+  # Deliberately a *base* install: the suite is 43 tests and passes with vnstock absent,
+  # which is the promise the `[vci]` extra makes. Installing it here would add no tests
+  # and would turn an upstream vnstock break into a red build on unrelated PRs.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/ -q
+
+  # The root of this repo *is* the package directory, reconciled by
+  # `package-dir = {"vn_market_data" = "."}`, and `packages` is an explicit list. That
+  # combination fails quietly: a new subpackage that nobody added to the list still
+  # imports fine from an editable install and is simply absent from the wheel. So build
+  # the real artifact and import it from a directory where the source tree cannot be
+  # shadowing it.
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --wheel
+      - name: Install the wheel and import it from elsewhere
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/wheel-venv/bin/python - <<'PY'
+          import importlib.resources as res
+          import vn_market_data as vmd
+          from vn_market_data.sources import base, dnse, http, registry, vci, vndirect
+
+          missing = [n for n in ("get_ohlcv", "get_board") if not hasattr(vmd, n)]
+          assert not missing, f"wheel is missing exports: {missing}"
+          assert res.files("vn_market_data").joinpath("schema.sql").is_file(), \
+              "schema.sql did not ship as package data — a bare install cannot create its store"
+          print(f"ok: {len(vmd.__all__)} exports, sources import with vnstock absent")
+          PY
+
+  # Gated on scaling ratios only. A ratio carries its own limit from the benchmark that
+  # produced it because it is a claim about the algorithm — "5x the rows costs under 6x"
+  # — and holds on any machine. The absolute timings in benchmarks/baseline.json are
+  # per-machine and are NOT checked here; they would fail on every runner.
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: Run the store benchmark
+        run: python -m vn_market_data.benchmarks.bench_store > bench.json
+      - name: Check scaling ratios against their declared limits
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+
+          run = json.loads(pathlib.Path("bench.json").read_text())
+          ratios = run.get("ratios", [])
+          if not ratios:
+              sys.exit("no ratios in the benchmark output — nothing was gated")
+
+          breaches = 0
+          for r in ratios:
+              breach = r["value"] > r["limit"]
+              breaches += breach
+              print(f"{'FAIL' if breach else 'ok  '}  {r['id']:<40} "
+                    f"{r['value']:>7.2f}x   limit {r['limit']:>5.1f}x")
+              if breach:
+                  print(f"        {r['note']}")
+
+          print(f"\n{len(ratios)} ratios, {breaches} over limit")
+          sys.exit(1 if breaches else 0)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-store-json
+          path: bench.json
