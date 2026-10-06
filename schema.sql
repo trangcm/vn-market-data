@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS md_board (
     foreign_buy_value REAL, foreign_sell_value REAL, foreign_net_value REAL,
     ceiling REAL, floor REAL, ref_price REAL, close REAL,
     traded_value REAL, traded_volume REAL,  -- today's accumulated match (full VND / shares)
+    vwap  REAL,                             -- session average match price (full VND)
+    depth TEXT,                             -- JSON {"bids": [[price, volume], ...], "asks": ...}, best first
     source TEXT NOT NULL,
     PRIMARY KEY (symbol, ts)
 );
@@ -74,10 +76,15 @@ CREATE TABLE IF NOT EXISTS md_statement_periods (
 );
 
 -- Dividend/corporate-action events, replace-all per symbol on refresh.
+-- `ex_date` is empty on an event the issuer has announced but not yet dated, so
+-- `announced_date` (when it was published) is the only date such a row has — and the
+-- only thing that can tell yesterday's declaration from a five-month-old approval
+-- that was never issued. Both are legal; only one belongs on a two-week calendar.
 CREATE TABLE IF NOT EXISTS md_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL, event_code TEXT,
     type TEXT, ex_date TEXT, record_date TEXT, pay_date TEXT,
+    announced_date TEXT,
     value_per_share REAL, ratio REAL, title TEXT,
     source TEXT NOT NULL, fetched_at TEXT NOT NULL
 );
@@ -92,6 +99,7 @@ CREATE TABLE IF NOT EXISTS md_fetch_meta (
     fetched_at TEXT NOT NULL,
     source     TEXT NOT NULL,
     floor      TEXT,                        -- oldest date ever *asked* for (ohlcv only)
+    withheld   TEXT,                        -- today's bar served truncated and not banked on this fetch (ohlcv only)
     PRIMARY KEY (symbol, kind)
 );
 
@@ -111,4 +119,26 @@ CREATE TABLE IF NOT EXISTS md_ohlcv_seams (
     band        REAL,                       -- the band it was judged against
     repaired_at TEXT NOT NULL,
     PRIMARY KEY (symbol, seam_date)
+);
+
+-- One row per suspect-thin bar the adapter has taken to a second source. A bar far
+-- below the symbol's own recent volume is either a fragment of a session the feed never
+-- settled (2026-08-28: the primary source served the whole market its first few minutes
+-- of trading) or a genuinely quiet day — and 0.8% of real settled bars are that thin, so
+-- the symbol's own history cannot tell those apart. A second reading can, and this is
+-- where the ruling lives, for two reasons. It stops a truly-thin symbol being re-checked
+-- every TTL, and — the reason it exists at all — `verdict='fragment'` **refuses `source`
+-- that date from then on**. The feed that served the fragment did not revise it three
+-- days later, so without the refusal the next 4-hourly top-up re-banks the fragment over
+-- the repair, forever. Every other source stays free to write the date.
+CREATE TABLE IF NOT EXISTS md_ohlcv_stubs (
+    symbol          TEXT NOT NULL,
+    date            TEXT NOT NULL,
+    source          TEXT NOT NULL,          -- who served the suspect bar
+    suspect_volume  REAL,
+    checked_against TEXT,                   -- the source that adjudicated it
+    resolved_volume REAL,
+    verdict         TEXT NOT NULL,          -- 'fragment' | 'true'
+    checked_at      TEXT NOT NULL,
+    PRIMARY KEY (symbol, date)
 );

@@ -27,15 +27,40 @@ MAX_BYTES = 8 * 1024 * 1024
 
 
 def get_capped(url: str, *, params=None, headers=None, timeout=None,
-               max_bytes: int = MAX_BYTES, what: str = "") -> tuple[int, bytes]:
+               max_bytes: int = MAX_BYTES, what: str = "",
+               client: httpx.Client | None = None) -> tuple[int, bytes]:
     """``GET url`` → ``(status_code, body)``, reading at most *max_bytes* of body.
 
     Network errors propagate as ``httpx.HTTPError``, exactly as ``httpx.get`` raises
     them, so callers keep their existing handling. A non-200 returns its status with an
     empty body — every caller here decides on the status alone and none of them parse an
     error page. *what* names the fetch in the overrun message.
+
+    Without *client* every call opens its own connection, which is right for a source
+    asked once per pass. A source that pages through one host hundreds of times per
+    pass hands in a ``httpx.Client`` so the pages ride one keep-alive connection: an
+    edge that rate-limits *new connections* (CafeF drops ~20% of SYNs to one of its
+    two addresses under a fresh-connection-per-page crawl, each one costing the whole
+    connect timeout) never sees the second one.
     """
-    with httpx.stream("GET", url, params=params, headers=headers, timeout=timeout) as r:
+    return _capped("GET", url, params=params, headers=headers, timeout=timeout,
+                   max_bytes=max_bytes, what=what, client=client)
+
+
+def post_capped(url: str, *, json=None, headers=None, timeout=None,
+                max_bytes: int = MAX_BYTES, what: str = "",
+                client: httpx.Client | None = None) -> tuple[int, bytes]:
+    """``POST url`` with a JSON body → ``(status_code, body)``, under the same cap and
+    the same contract as :func:`get_capped`. For the providers whose read endpoints
+    take their arguments as a body (Vietcap's candles and price board)."""
+    return _capped("POST", url, json=json, headers=headers, timeout=timeout,
+                   max_bytes=max_bytes, what=what, client=client)
+
+
+def _capped(method: str, url: str, *, max_bytes: int, what: str,
+            client: httpx.Client | None, **request) -> tuple[int, bytes]:
+    stream = client.stream if client is not None else httpx.stream
+    with stream(method, url, **request) as r:
         if r.status_code != 200:
             return r.status_code, b""
         buf = bytearray()

@@ -18,8 +18,9 @@ jobs:
   # a comprehension); 3.12 is what it is developed on. Testing the ends catches the
   # syntax-floor mistakes without paying for every version in between.
   #
-  # Deliberately a *base* install: the suite is 43 tests and passes with vnstock absent,
-  # which is the promise the `[vci]` extra makes. Installing it here would add no tests
+  # Deliberately a *base* install: the suite passes with vnstock absent (the few
+  # VCISource tests that need pandas skip), which is what the default chain needs.
+  # Installing the `[vci]` extra here would only un-skip those
   # and would turn an upstream vnstock break into a red build on unrelated PRs.
   test:
     runs-on: ubuntu-latest
@@ -58,7 +59,7 @@ jobs:
           /tmp/wheel-venv/bin/python - <<'PY'
           import importlib.resources as res
           import vn_market_data as vmd
-          from vn_market_data.sources import base, dnse, http, registry, vci, vndirect
+          from vn_market_data.sources import base, dnse, http, registry, vci, vietcap, vndirect
 
           missing = [n for n in ("get_ohlcv", "get_board") if not hasattr(vmd, n)]
           assert not missing, f"wheel is missing exports: {missing}"

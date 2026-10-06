@@ -138,8 +138,6 @@ def compare(sources, sample):
 def main(argv):
     sources = build_sources()
     print("chain:", " → ".join(s.name for s in sources))
-    if len(sources) < 2:
-        print("  (only one source installed — try `pip install vn-market-data[vci]`)")
 
     sample = [(s.upper(), s.upper().endswith("INDEX")) for s in argv] or DEFAULT_SAMPLE
     probe(sources, sample[0][0])

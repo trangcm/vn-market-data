@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vn-market-data"
-version = "0.2.0"
+version = "0.3.0"
 description = "Cache-first, source-abstracted market data for the Vietnamese stock market (HOSE/HNX/UPCOM)."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -24,7 +24,7 @@ requires-python = ">=3.10"
 # METADATA and on every mirror that ever indexes it, and it is not a support channel.
 # Bug reports go to the Issues URL below, which is the one that actually gets read.
 authors = [{ name = "Mino", email = "trangcm@users.noreply.github.com" }]
-keywords = ["vietnam", "stock-market", "hose", "ohlcv", "market-data", "vnstock"]
+keywords = ["vietnam", "stock-market", "hose", "ohlcv", "market-data"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Financial and Insurance Industry",
@@ -35,8 +35,8 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Investment",
 ]
 
-# The base install is deliberately light: DNSE (OHLCV) and VNDirect (market turnover)
-# are pure httpx, and SQLite is in the standard library. Nothing here pulls pandas.
+# The base install is deliberately light: every source in the default chain is pure
+# httpx, and SQLite is in the standard library. Nothing here pulls pandas.
 dependencies = ["httpx>=0.24"]
 
 # The repository these point at is the published one produced by the subtree split — it
@@ -49,11 +49,13 @@ Source = "https://github.com/trangcm/vn-market-data"
 Issues = "https://github.com/trangcm/vn-market-data/issues"
 
 [project.optional-dependencies]
-# The VCI backend — the only source for the price board, financial statements and
-# corporate actions, and the OHLCV fallback. vnstock pulls pandas, which is most of the
-# install size, so it stays opt-in; build_sources() drops VCI and logs a warning when
-# it is absent rather than letting an ImportError surface mid-fetch.
-vci = ["vnstock>=4.0,<5.0"]
+# VCISource — the vnstock-backed reader of the Vietcap endpoints the default chain's
+# VietcapSource reads over plain HTTP. Nothing in the default chain needs it; it is an
+# opt-in class (set_sources) and pulls pandas, which is most of the install size.
+# Pinned, not ranged: 4.0.4 is the version VCISource was compared against, and PyPI
+# quarantined the project on 2026-09-24 over what later 4.0.x releases did on import.
+# While the quarantine stands this extra cannot be installed from PyPI at all.
+vci = ["vnstock==4.0.4"]
 dev = ["pytest>=7"]
 
 [tool.setuptools]

@@ -1,6 +1,6 @@
 """Everything the library does, in one runnable file.
 
-    pip install vn-market-data      # or vn-market-data[vci] for the board
+    pip install vn-market-data
     python examples/quickstart.py
 
 No configuration: the first call creates `./vn_market_data.db` (override with
@@ -44,13 +44,13 @@ def daily_candles():
 
 
 def price_board():
-    """Needs the `[vci]` extra. Without it *no* source implements the capability, and
-    that raises `NotSupported` rather than returning an empty board — an empty board is
-    a claim about the market, and this is a claim about your install."""
+    """A chain in which *no* source implements the capability (one you set yourself)
+    raises `NotSupported` rather than returning an empty board — an empty board is a
+    claim about the market, and this is a claim about your chain."""
     try:
         board = vmd.get_board([SYMBOL, "VNM"])
     except vmd.NotSupported:
-        print("\nboard: no source implements it — `pip install vn-market-data[vci]`")
+        print("\nboard: no source in the chain implements it")
         return
     if not board:
         print("\nboard: every source down and nothing recent enough in the store — "

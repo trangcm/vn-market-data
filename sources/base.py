@@ -9,12 +9,27 @@ makes them interchangeable:
 - ``get_ohlcv``      → oldest-first ``[{date,open,high,low,close,volume}]``; ``[]`` = no candles.
 - ``get_board``      → ``{sym: {foreign_buy_value, foreign_sell_value, foreign_net_value,
                        ceiling, floor, ref_price, close, traded_value, traded_volume}}``
-                       (prices and values full VND; traded_* = today's accumulated match).
-- ``get_statements`` → ``{kind, periods, statements:{income,balance,cashflow}, ratio_extra}``
-                       or ``None``. Raw, source-parsed line items — no ratio math here, so
-                       the field→alias map is the only per-source knowledge.
-- ``get_events``     → ``[{symbol,type,ex_date,record_date,pay_date,value_per_share,
-                       ratio,title,event_code}]``; ``[]`` = none.
+                       (prices and values full VND; traded_* = today's accumulated match),
+                       plus optional ``vwap`` (session average match price) and
+                       ``bids``/``asks`` (``[[price, volume], …]`` best first; None =
+                       the source has no depth, ``[]`` = an empty side).
+- ``get_statements`` → ``{kind, periods, statements:{income,balance,cashflow}, ratio_extra,
+                       ratio_labels}`` or ``None``. Raw, source-parsed line items — no
+                       ratio math here, so the field→alias map is the only per-source
+                       knowledge. ``ratio_extra`` is ``{name: {period: value}}`` keyed by
+                       the period the *source* dated each value to (``"2025"``,
+                       ``"2026-Q2"``), and may reach well past ``periods``; a source
+                       stamps ``ratio_labels`` = :data:`RATIO_LABELS` to say so. A source
+                       may leave it ``{}`` where nothing reads it — VCI fetches the series
+                       for banks only (``VCISource.ratio_for_general``).
+- ``get_events``     → ``[{symbol,type,ex_date,status,record_date,pay_date,
+                       announced_date,value_per_share,ratio,title,event_code}]``;
+                       ``[]`` = none.
+                       ``status`` is ``"confirmed"`` (``ex_date`` set) or
+                       ``"announced"`` — an entitlement whose rate has been published
+                       but whose dates the issuer has not filed yet, which carries
+                       ``ex_date: ""``. Dropping those is what made a declared
+                       dividend look like no dividend at all.
 - ``get_index_constituents`` → ordered ``["ACB", "BID", …]`` for an index group
                        (e.g. ``"VN30"``); ``[]`` = the group is unknown/empty.
 - ``get_market_turnover`` → oldest-first ``[{date,value,matched,put_through,volume}]``
@@ -27,6 +42,28 @@ makes them interchangeable:
                        when no session is under way. Daily feeds only publish a
                        session's candle after the close, so this is the only way to
                        show the index where it actually is right now.
+- ``get_foreign_history`` → oldest-first ``[{date, buy_value, sell_value, net_value,
+                       buy_volume, sell_volume, net_volume}]`` for one symbol over
+                       ``[start, end]``: the exchange's **settled** foreign
+                       (khối ngoại) trading per session, values full VND, volumes in
+                       shares. ``[]`` = nothing in the window. The board's foreign
+                       columns are a session-to-date accumulator and only final after
+                       the close; this is the post-close figure, and the live session
+                       is absent until it settles.
+- ``get_foreign_archive`` → the same row shape over a **multi-year** window, for
+                       history the settled source's short archive no longer holds.
+                       Net agrees with the settled figure; gross buy/sell may count
+                       both sides of a foreign-to-foreign put-through. A separate
+                       capability on purpose, so a deep-history source can never
+                       become the settle job's fallback (see ``vndirect``).
+- ``get_trade_tape`` → one symbol's matched prints for the **current or last closed
+                       session** ``{symbol, date, trades: [{date, time, price, volume,
+                       side, accumulated_volume}]}``, oldest-first, price full VND,
+                       ``side`` ``"buy"``/``"sell"`` for the initiating side or ``None``
+                       on an auction print. ``None`` = the symbol has not traded. No
+                       past session can be asked for, so ``date`` says which one it is,
+                       and a tape whose ``accumulated_volume`` does not chain raises
+                       ``SourceUnavailable`` rather than returning short.
 
 A genuinely-empty result returns ``[]``/``None`` and must **not** raise. Only a
 transient failure (rate-limit / network / 5xx) raises ``SourceUnavailable``, which
@@ -38,16 +75,52 @@ stops the chain, because "no dividends" is an answer. A failed fetch that return
 instead of raising is therefore not a degraded answer — it is a wrong one, cached and
 served as fact.
 """
+import threading
 
 
 class NotSupported(Exception):
     """This source does not implement this capability — adapter tries the next source."""
 
 
+#: Stamped on a statements payload as ``ratio_labels`` when its ``ratio_extra`` is
+#: keyed by the period each value is dated to upstream. Payloads cached before
+#: 2026-09-18 carry VCI's 2018 rows under the statements' newest labels instead, so a
+#: map without the stamp is unreadable, not current — the adapter serves it as ``{}``.
+RATIO_LABELS = "source"
+
+
+# Per thread, because a source runs in whichever thread called the adapter
+# (`asyncio.to_thread` included) and the adapter reads it back in that same thread.
+_metered = threading.local()
+
+
+def report_units(n: int) -> None:
+    """Tell the adapter what the request in progress cost this source's own meter.
+
+    Optional: a source whose provider meters per request, or not at all, never calls it.
+    One that makes several metered sub-requests per call — Vietcap's statements are several
+    requests, one more when the symbol is a bank — calls it once the
+    call has succeeded, and the adapter stamps the number on the
+    :class:`~vn_market_data.adapter.SourceCall` it records."""
+    _metered.units = n
+
+
+def _take_units() -> int | None:
+    n = getattr(_metered, "units", None)
+    _metered.units = None
+    return n
+
+
 class SourceUnavailable(Exception):
     """Transient unavailability (rate-limited / network / 5xx). The adapter tries the
     next source; if *every* source is unavailable it propagates, so a caller can tell
     "the market has no answer" from "nobody could be reached" and retry only the second."""
+
+
+class SourceUnreachable(SourceUnavailable):
+    """The network failed (connection, timeout, 5xx), as opposed to the source refusing
+    (a quota). Falls through exactly like its parent; the adapter records it as
+    ``unreachable`` so a quota gauge does not read a dropped connection as a trip."""
 
 
 class DataSource:
@@ -76,3 +149,12 @@ class DataSource:
 
     def get_market_turnover(self, index: str, start: str, end: str) -> list[dict]:
         raise NotSupported("get_market_turnover")
+
+    def get_foreign_history(self, symbol: str, start: str, end: str) -> list[dict]:
+        raise NotSupported("get_foreign_history")
+
+    def get_foreign_archive(self, symbol: str, start: str, end: str) -> list[dict]:
+        raise NotSupported("get_foreign_archive")
+
+    def get_trade_tape(self, symbol: str) -> dict | None:
+        raise NotSupported("get_trade_tape")

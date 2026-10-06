@@ -118,6 +118,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE md_board ADD COLUMN traded_value REAL")
     if bcols and "traded_volume" not in bcols:
         conn.execute("ALTER TABLE md_board ADD COLUMN traded_volume REAL")
+    if bcols and "vwap" not in bcols:
+        # Session VWAP + top-of-book depth (display only). Older rows stay NULL,
+        # which readers report as "not read", not as an empty book.
+        conn.execute("ALTER TABLE md_board ADD COLUMN vwap REAL")
+    if bcols and "depth" not in bcols:
+        conn.execute("ALTER TABLE md_board ADD COLUMN depth TEXT")
 
     mcols = {r[1] for r in conn.execute("PRAGMA table_info(md_fetch_meta)")}
     if mcols and "floor" not in mcols:
@@ -126,5 +132,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # which is the old behaviour — so an existing cache re-probes each symbol once
         # and records its answer.
         conn.execute("ALTER TABLE md_fetch_meta ADD COLUMN floor TEXT")
+    if mcols and "withheld" not in mcols:
+        # The session whose bar the last fetch was served but did not bank (truncated,
+        # `upsert_ohlcv`). NULL on old rows = nothing withheld, the old behaviour.
+        conn.execute("ALTER TABLE md_fetch_meta ADD COLUMN withheld TEXT")
+
+    ecols = {r[1] for r in conn.execute("PRAGMA table_info(md_events)")}
+    if ecols and "announced_date" not in ecols:
+        # When the issuer published the event, as opposed to when it goes ex. It is
+        # the only date an announced-but-undated entitlement has, so without it such
+        # a row cannot be aged or windowed at all. Rows banked before this column
+        # existed stay NULL and are filled in by the next refresh of that symbol —
+        # events are replace-all, so no backfill is needed here.
+        conn.execute("ALTER TABLE md_events ADD COLUMN announced_date TEXT")
 
     _backfill_statement_archive(conn)

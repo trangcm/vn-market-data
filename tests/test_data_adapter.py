@@ -12,39 +12,45 @@ import logging
 import json
 import sqlite3
 from contextlib import closing
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 import vn_market_data as vmd
 from vn_market_data import adapter, store
-from vn_market_data.sources.base import DataSource, NotSupported, SourceUnavailable
+from vn_market_data.market_hours import ICT
+from vn_market_data.sources.base import (RATIO_LABELS, DataSource, NotSupported,
+                                         SourceUnavailable)
 from vn_market_data.sources.registry import build_sources
 
 
 # ── DA-U-02: registry (ordered chain; TCBS rejected) ─────────────────────────
 
-def _expected_chain():
-    """The default chain for *this* environment. VCI rides the optional `[vci]` extra,
-    so it is present only where vnstock is — in the container, not necessarily on a
-    contributor's laptop."""
-    return ["dnse", "vci", "vndirect"] if vmd.vnstock_installed() else ["dnse", "vndirect"]
-
-
-def test_registry_is_dnse_then_vci_then_vndirect():
+def test_registry_is_dnse_then_vietcap_then_vndirect_then_cafef_then_kbs():
     names = [s.name for s in build_sources()]
-    assert names == _expected_chain()   # OHLCV primary, board, market turnover
+    # OHLCV primary, board, market turnover, settled foreign flow, trade tape — each of
+    # the last four answers one capability nothing before it has, so order only matters
+    # for the capabilities they share.
+    assert names == ["dnse", "vietcap", "vndirect", "cafef", "kbs"]
     assert "tcbs" not in names          # TCBS public API is dead (rejected)
 
 
-def test_registry_drops_vci_when_vnstock_is_absent(monkeypatch, caplog):
-    """Without the extra the chain must still build — losing a capability, not raising.
-    An ImportError escaping mid-fetch instead would look like a data outage."""
-    monkeypatch.setattr("vn_market_data.sources.registry.vnstock_installed", lambda: False)
-    with caplog.at_level("WARNING"):
-        names = [s.name for s in build_sources()]
-    assert names == ["dnse", "vndirect"]
-    assert "vnstock" in caplog.text and "[vci]" in caplog.text   # says how to fix it
+def test_the_default_chain_does_not_need_vnstock(monkeypatch):
+    """Board, statements and events used to ride an optional install and vanish
+    without it. The chain is the same everywhere now, and building it must not so
+    much as look for the package."""
+    import builtins
+    real = builtins.__import__
+
+    def no_vnstock(name, *a, **kw):
+        if name.split(".")[0] in ("vnstock", "vnai", "pandas"):
+            raise ImportError(name)
+        return real(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", no_vnstock)
+    chain = build_sources()
+    assert [s.name for s in chain][1] == "vietcap"
+    assert "vci" not in [s.name for s in chain]
 
 
 # ── DA-U-02: _query fallback semantics ───────────────────────────────────────
@@ -108,7 +114,7 @@ def test_set_sources_none_restores_the_builtin_chain(restore_sources):
     vmd.set_sources([_Src("only", ohlcv=[])])
     assert [s.name for s in vmd.get_sources()] == ["only"]
     vmd.set_sources(None)
-    assert [s.name for s in vmd.get_sources()] == _expected_chain()
+    assert [s.name for s in vmd.get_sources()] == ["dnse", "vietcap", "vndirect", "cafef", "kbs"]
 
 
 # ── DA-U-03: source contract ─────────────────────────────────────────────────
@@ -150,6 +156,145 @@ def test_vci_board_resolves_the_match_price_not_the_auction_one():
     # keep resolving across vnstock versions.
     assert pick_col(cols, "foreign_buy") == "match/foreign_buy_value"
     assert pick_col(cols, "match", "close_price") is None
+
+
+class _Frame:
+    """The bit of a pandas frame `get_events` reads on its fallback path: an emptiness
+    flag and `to_dict("records")`. Kept local so the package's tests stay free of a
+    pandas import the source itself does not make."""
+    def __init__(self, rows):
+        self._rows, self.empty = rows, not rows
+
+    def to_dict(self, _orient):
+        return list(self._rows)
+
+
+_ELC_EVENTS = [
+    {"eventTitleVi": "Phát hành cổ phiếu - Trả Cổ tức bằng Cổ phiếu tỉ lệ 5.0%",
+     "exrightDate": "2026-09-10T00:00:00", "recordDate": "2026-09-11T00:00:00",
+     "exerciseRatio": 0.05, "eventCode": "ISS"},
+    {"eventTitleVi": "Phát hành cổ phiếu - Cổ phiếu thưởng tỉ lệ 2.0%",
+     "exrightDate": "2026-09-10T00:00:00", "recordDate": "2026-09-11T00:00:00",
+     "exerciseRatio": 0.02, "eventCode": "ISS"},
+    {"eventTitleVi": "ELC - Tổ chức ĐHĐCĐ thường niên 2026",   # excluded: AGM
+     "exrightDate": "2026-03-17T00:00:00", "exerciseRatio": None},
+]
+
+
+def _serve_events(monkeypatch, *, filtered=None, frame=None):
+    """Stand in for vnstock. `filtered` answers the DIV,ISS request the source prefers;
+    `None` there makes that call fail the way a moved private method would, so the
+    public-frame fallback is what gets exercised."""
+    import sys, types
+    seen = {}
+
+    class _Provider:
+        def _fetch_events(self, event_codes=None):
+            seen["event_codes"] = event_codes
+            if filtered is None:
+                raise AttributeError("no such method in this vnstock")
+            return list(filtered)
+
+    class _Company:
+        def __init__(self, symbol, source):
+            self._provider = _Provider()
+
+        def events(self):
+            seen["fell_back"] = True
+            return _Frame(frame or [])
+
+    mod = types.ModuleType("vnstock")
+    mod.Company = _Company
+    monkeypatch.setitem(sys.modules, "vnstock", mod)
+    return seen
+
+
+def test_vci_events_survive_a_symbol_that_has_never_paid_cash(monkeypatch):
+    """The bug this guards: VCI omits a field entirely when no row in the answer carries
+    it. ELC has only ever issued shares, so its answer has no `value_per_share`/
+    `payout_date` — and requiring those columns dropped every event the symbol has,
+    including the 5% stock dividend three days from its ex-date. SM's Upcoming Dividends
+    card read empty for a dividend that was actually coming."""
+    from vn_market_data.sources.vci import VCISource
+
+    seen = _serve_events(monkeypatch, filtered=_ELC_EVENTS)
+    events = VCISource().get_events("ELC")
+
+    assert seen["event_codes"] == "DIV,ISS"   # not the everything-page
+    assert [(e["type"], e["ex_date"], e["ratio"]) for e in events] == [
+        ("STOCK", "2026-09-10", 0.05), ("STOCK", "2026-09-10", 0.02)]
+    # The field the answer does not have reads as no cash, not as a missing symbol.
+    assert all(e["value_per_share"] == 0.0 and e["pay_date"] == "" for e in events)
+
+
+def test_vci_events_fall_back_to_the_public_frame(monkeypatch):
+    """`_fetch_events` is vnstock-private. A version that moves it must cost the code
+    filter, not the feed — the frame's rows are already snake_case."""
+    from vn_market_data.sources.vci import VCISource, _snake
+
+    frame = [{_snake(k): v for k, v in r.items()} for r in _ELC_EVENTS]
+    seen = _serve_events(monkeypatch, filtered=None, frame=frame)
+    events = VCISource().get_events("ELC")
+
+    assert seen["fell_back"] is True
+    assert [(e["type"], e["ratio"]) for e in events] == [("STOCK", 0.05), ("STOCK", 0.02)]
+
+
+def test_vci_events_publish_an_announcement_with_no_date_yet(monkeypatch):
+    """The guard that was **dropped** on 2026-09-16, and why.
+
+    `exright_date` used to be required, so an answer carrying none returned `[]`. That
+    was the right shape for an upstream rename and the wrong one for the ordinary case
+    it could not tell apart: VCI publishes an entitlement's rate the day the board
+    resolves it and fills the date in only when the issuer files the record date. DRI
+    declared 1,000 VND/share on 2026-09-11 and VPB a 26.04104% bonus on the 15th, and
+    both were invisible — not late, not flagged, *absent* — while their rates sat in
+    the feed. A dividend that has been declared must not read as no dividend.
+
+    So a missing date is now a status. The rename it used to guard against is still
+    visible, but as "every row on every symbol reads announced", which
+    `/api/monitor.announced_events` warns on — a loud wrong state instead of a silent
+    empty one.
+    """
+    from vn_market_data.sources.vci import VCISource
+
+    _serve_events(monkeypatch, filtered=[
+        {"eventTitleVi": "Trả cổ tức bằng tiền mặt - Cả năm 2025 - 1,000 VND",
+         "publicDate": "2026-09-11T00:00:00", "valuePerShare": 1000.0,
+         "exerciseRatio": 0.1, "eventCode": "DIV"}])
+    [ev] = VCISource().get_events("DRI")
+
+    assert ev["status"] == "announced"
+    # Empty string, never None: every downstream guard is a truthiness or a string
+    # comparison (`e.get("ex_date", "") >= cutoff` in scrapers/financials.py would
+    # raise TypeError on a None), and an empty sorts first under `ORDER BY ex_date`.
+    assert ev["ex_date"] == "" and ev["type"] == "CASH"
+    assert ev["value_per_share"] == 1000.0
+    # The one date it has. Without it, an entitlement announced this morning and one
+    # announced in April and never dated are the same row.
+    assert ev["announced_date"] == "2026-09-11"
+
+
+def test_vci_events_mark_a_dated_event_confirmed(monkeypatch):
+    """The other half of the same field: a row VCI has dated must not be softened into
+    an announcement, or the card would stop telling the two apart in the direction that
+    matters — one of these adjusts the price on a known day."""
+    from vn_market_data.sources.vci import VCISource
+
+    _serve_events(monkeypatch, filtered=_ELC_EVENTS)
+    events = VCISource().get_events("ELC")
+    assert [e["status"] for e in events] == ["confirmed", "confirmed"]
+
+
+def test_vci_events_refuse_an_answer_that_cannot_be_classified(monkeypatch):
+    """The guard that stays. `event_title_vi` is the only field the classifier reads to
+    decide cash-vs-stock-vs-not-a-dividend; without it nothing can be published at all,
+    and an answer missing it is an upstream change rather than rows to emit."""
+    from vn_market_data.sources.vci import VCISource
+
+    _serve_events(monkeypatch, filtered=[{"exrightDate": "2026-09-10T00:00:00",
+                                          "exerciseRatio": 0.05}])
+    assert VCISource().get_events("ELC") == []
 
 
 # ── DA-U-01: store-first cache (temp DB, fake source) ────────────────────────
@@ -254,12 +399,14 @@ def test_stale_tail_tops_up_from_the_last_stored_candle(temp_db, monkeypatch):
     adapter.get_ohlcv("HPG", lookback_days=30)
     assert src.calls == [((_WED - timedelta(days=30)).isoformat(), _WED.isoformat())]
 
-    # Next weekday, meta stale: fetch again — but only from the last candle we hold,
-    # not the whole 30-day window again.
+    # Next weekday, meta stale: fetch again — but only from the tail we hold, not the
+    # whole 30-day window again. One settled bar before max_d is re-read with it: that
+    # overlap is where a sub-band rescale shows (see DA-U-01b).
     _pin_today(monkeypatch, _WED + timedelta(days=1))
     adapter.get_ohlcv("HPG", lookback_days=30, ttl_s=0)
     assert len(src.calls) == 2
-    assert src.calls[1][0] == _WED.isoformat(), "top-up must start at max_d, not at start"
+    assert src.calls[1][0] == (_WED - timedelta(days=1)).isoformat(), (
+        "top-up must start one banked bar before max_d, not at start")
 
 
 def test_no_top_up_when_the_last_candle_is_already_today(temp_db, monkeypatch):
@@ -329,11 +476,115 @@ def test_short_history_is_not_refetched_on_every_call(temp_db, monkeypatch):
     _pin_today(monkeypatch, _WED + timedelta(days=1))
     adapter.get_ohlcv("NEW", lookback_days=180, ttl_s=0)
     assert len(src.calls) == 2
-    assert src.calls[-1][0] == _WED.isoformat(), "top-up must start at max_d, not at start"
+    assert src.calls[-1][0] == (_WED - timedelta(days=1)).isoformat(), (
+        "top-up must start one banked bar before max_d, not at start")
 
     # But a genuinely deeper request is still a miss.
     adapter.get_ohlcv("NEW", lookback_days=365)
     assert src.calls[-1][0] == (_WED + timedelta(days=1) - timedelta(days=365)).isoformat()
+
+
+def _pin_close(monkeypatch, close: datetime) -> None:
+    monkeypatch.setattr(adapter.market_hours, "last_session_close", lambda now=None: close)
+
+
+def _stamp_fetch(symbol: str, at: datetime) -> None:
+    with closing(adapter.connect()) as conn:
+        conn.execute("UPDATE md_fetch_meta SET fetched_at=? WHERE symbol=? AND kind='ohlcv'",
+                     (at.astimezone(timezone.utc).isoformat(), symbol))
+        conn.commit()
+
+
+def test_a_pre_close_read_is_caught_up_once_after_the_close(temp_db, monkeypatch):
+    """2026-09-24: 97 symbols read between 13:04 and 15:15 ICT had no bar for the
+    session, and the 4-h TTL called them fresh until ~17:00 — so every post-close job
+    ran a session behind. A read made before the session's bar was published must not
+    count as fresh once it has been; the catch-up is stamped after the close, so it
+    happens exactly once."""
+    close = (datetime.now(ICT) - timedelta(hours=2)).replace(microsecond=0)
+    session = close.date()
+    _pin_close(monkeypatch, close)
+    _pin_today(monkeypatch, session)
+    src = _RangeSrc(_rows_between(session - timedelta(days=60), session - timedelta(days=1)))
+    vmd.set_sources([src])
+    adapter.get_ohlcv("DRI", lookback_days=30)
+    _stamp_fetch("DRI", close - timedelta(minutes=30))       # read mid-session, inside the TTL
+
+    src._rows = _rows_between(session - timedelta(days=60), session)   # bar published
+    rows = adapter.get_ohlcv("DRI", lookback_days=30)        # default 4-h TTL: "fresh"
+    assert len(src.calls) == 2, "a pre-close read must not stand in for the close"
+    assert rows[-1]["date"] == session.isoformat()
+
+    adapter.get_ohlcv("DRI", lookback_days=30)
+    assert len(src.calls) == 2, "caught up — the TTL governs again"
+
+
+def test_a_session_that_printed_nothing_costs_one_catch_up(temp_db, monkeypatch):
+    """A symbol that did not trade gets no bar; the catch-up is stamped after the close
+    all the same, so it does not chase the missing bar on every call."""
+    close = (datetime.now(ICT) - timedelta(hours=2)).replace(microsecond=0)
+    session = close.date()
+    _pin_close(monkeypatch, close)
+    _pin_today(monkeypatch, session)
+    src = _RangeSrc(_rows_between(session - timedelta(days=60), session - timedelta(days=1)))
+    vmd.set_sources([src])
+    adapter.get_ohlcv("ILQ", lookback_days=30)
+    _stamp_fetch("ILQ", close - timedelta(minutes=30))
+
+    adapter.get_ohlcv("ILQ", lookback_days=30)
+    adapter.get_ohlcv("ILQ", lookback_days=30)
+    assert len(src.calls) == 2
+
+
+def test_a_catch_up_served_a_truncated_bar_is_retried(temp_db, monkeypatch):
+    """The feed can still serve the session's bar truncated after the close (2026-08-28,
+    an hour on). `upsert_ohlcv` withholds it — and if the catch-up then counted as done,
+    the TTL would hold the previous bar until ~20:00. So it retries, at most every
+    OHLCV_WITHHELD_RETRY, until the settled bar banks."""
+    now = datetime.now(ICT)
+    close = (now - timedelta(hours=2)).replace(microsecond=0)
+    session = close.date()
+    if session != now.date():
+        pytest.skip("needs a close earlier today (ICT) — the withhold keys on today")
+    _pin_close(monkeypatch, close)
+    _pin_today(monkeypatch, session)
+    src = _RangeSrc(_rows_between(session - timedelta(days=60), session - timedelta(days=1)))
+    vmd.set_sources([src])
+    adapter.get_ohlcv("DRI", lookback_days=30)
+    _stamp_fetch("DRI", close - timedelta(minutes=30))
+
+    fragment = dict(_rows_between(session, session)[0], volume=5)     # 0.5% of normal
+    src._rows = _rows_between(session - timedelta(days=60), session - timedelta(days=1)) + [fragment]
+    rows = adapter.get_ohlcv("DRI", lookback_days=30)                  # the catch-up
+    assert len(src.calls) == 2 and rows[-1]["date"] < session.isoformat(), "withheld"
+
+    adapter.get_ohlcv("DRI", lookback_days=30)
+    assert len(src.calls) == 2, "not before the retry interval"
+
+    _stamp_fetch("DRI", datetime.now(ICT) - adapter.OHLCV_WITHHELD_RETRY)
+    src._rows[-1] = _rows_between(session, session)[0]                 # settled
+    rows = adapter.get_ohlcv("DRI", lookback_days=30)
+    assert len(src.calls) == 3 and rows[-1]["date"] == session.isoformat()
+
+    _stamp_fetch("DRI", datetime.now(ICT) - adapter.OHLCV_WITHHELD_RETRY)
+    adapter.get_ohlcv("DRI", lookback_days=30)
+    assert len(src.calls) == 3, "banked — the retry stops"
+
+
+def test_no_catch_up_before_the_bar_can_be_published(temp_db, monkeypatch):
+    """Minutes after the close the feed has not published the bar yet; a catch-up then
+    would be stamped post-close with nothing in it, and spend the one pass."""
+    close = (datetime.now(ICT) - timedelta(minutes=5)).replace(microsecond=0)
+    session = close.date()
+    _pin_close(monkeypatch, close)
+    _pin_today(monkeypatch, session)
+    src = _RangeSrc(_rows_between(session - timedelta(days=60), session - timedelta(days=1)))
+    vmd.set_sources([src])
+    adapter.get_ohlcv("DRI", lookback_days=30)
+    _stamp_fetch("DRI", close - timedelta(hours=2))
+
+    adapter.get_ohlcv("DRI", lookback_days=30)
+    assert len(src.calls) == 1
 
 
 # ── DA-U-01: the corporate-action seam detector ──────────────────────────────
@@ -562,6 +813,154 @@ def test_a_settled_seam_does_not_hide_a_later_rescale(temp_db, monkeypatch):
         "only the seam that went away — the settled one is still in the series")
 
 
+# ── DA-U-01b: a rescale inside the band ──────────────────────────────────────
+# Most corporate actions move the price by less than the band: DRI's 1,000 VND dividend
+# on 14,900 is 6.7%, on a ±15% board. The seam test above cannot see it, and the tail
+# top-up that re-serves the last banked bar already adjusted writes the join itself.
+
+
+def test_a_sub_band_rescale_on_the_overlap_forces_a_full_refetch(temp_db, monkeypatch,
+                                                                caplog):
+    """DRI, 2026-09-22: the re-served 09-21 bar came back ×0.93 over 09-18 left on the
+    old scale, and the pattern engine drew a confirmed Double Top across the join."""
+    _pin_today(monkeypatch, _WED)
+    _bank("DRI", _rows_between(_WED - timedelta(days=40), _WED - timedelta(days=1)),
+          board={"ceiling": 115.0, "floor": 85.0, "ref_price": 100.0})
+    src = _RangeSrc(_seamed(_WED - timedelta(days=60), _WED,
+                            scale=0.93, at="1900-01-01"))   # source is fully adjusted
+    vmd.set_sources([src])
+
+    with caplog.at_level("WARNING"):
+        rows = adapter.get_ohlcv("DRI", lookback_days=30, ttl_s=0)
+
+    assert len(src.calls) == 2, "the tail read, then the repair"
+    assert src.calls[-1][0] == (_WED - timedelta(days=40 + adapter.SEAM_REPAIR_LEAD_DAYS)
+                                ).isoformat(), "the repair reaches every candle held"
+    assert "rescaled" in caplog.text
+    closes = [r["close"] for r in rows]
+    assert max(closes) / min(closes) < 1.01, "one scale after the repair, not two"
+    with closing(vmd.connect()) as conn:
+        got = store.rescaled_symbols(conn)
+    assert set(got) == {"DRI"}, (
+        "the repair must reach the ledger, or the levels priced on the old scale are "
+        "never voided")
+
+
+def test_a_partial_bar_settling_is_not_a_rescale(temp_db, monkeypatch):
+    """The common re-read: the last bar was banked mid-session and the source now serves
+    the settled day. High, low and close move; the open does not — so no refetch."""
+    _pin_today(monkeypatch, _WED)
+    banked = _rows_between(_WED - timedelta(days=40), _WED - timedelta(days=1))
+    banked[-1].update(high=100.5, low=99.5, close=100.2)
+    _bank("HPG", banked, board={"ceiling": 107.0, "floor": 93.0, "ref_price": 100.0})
+    src = _RangeSrc(_rows_between(_WED - timedelta(days=60), _WED))
+    vmd.set_sources([src])
+
+    adapter.get_ohlcv("HPG", lookback_days=30, ttl_s=0)
+    assert len(src.calls) == 1, "a settling bar is not a corporate action"
+    with closing(vmd.connect()) as conn:
+        assert store.seams_repaired(conn, "HPG") == set()
+
+
+def test_find_rescale_needs_all_four_prices_to_move_together(temp_db):
+    _bank("X", _rows_between(_WED - timedelta(days=3), _WED))
+    day = _WED.isoformat()
+    scaled = {"date": day, "open": 93.0, "high": 93.93, "low": 92.07, "close": 93.0}
+    with closing(vmd.connect()) as conn:
+        got = store.find_rescale(conn, "X", [scaled])
+        assert got and got[0] == day and abs(got[1] - 0.93) < 1e-3
+        # A real move on the day: close alone off by 7% is trading, not adjustment.
+        moved = {"date": day, "open": 100.0, "high": 101.0, "low": 92.0, "close": 93.0}
+        assert store.find_rescale(conn, "X", [moved]) is None
+        # A bar never banked has nothing to compare against.
+        new = {**scaled, "date": (_WED + timedelta(days=1)).isoformat()}
+        assert store.find_rescale(conn, "X", [new]) is None
+
+
+def test_rescan_repairs_a_rescale_the_store_already_absorbed(temp_db, monkeypatch):
+    """The four symbols the tail check came too late for: the join is already banked,
+    old scale behind new. The rescan finds it, repairs once, and dates the ledger at the
+    join — the first banked bar on the new scale, which is what `seam_void` measures."""
+    _pin_today(monkeypatch, _WED)
+    join = (_WED - timedelta(days=5)).isoformat()
+    _bank("ELC", _seamed(_WED - timedelta(days=40), _WED - timedelta(days=1),
+                         scale=0.93, at=join),
+          board={"ceiling": 115.0, "floor": 85.0, "ref_price": 100.0})
+    src = _RangeSrc(_seamed(_WED - timedelta(days=60), _WED, scale=0.93, at="1900-01-01"))
+    vmd.set_sources([src])
+
+    assert adapter.rescan_rescale("ELC") == join
+    assert src.calls[-1][0] == (_WED - timedelta(days=40 + adapter.SEAM_REPAIR_LEAD_DAYS)
+                                ).isoformat()
+    with closing(vmd.connect()) as conn:
+        closes = [r["close"] for r in store.get_ohlcv_range(
+            conn, "ELC", "2000-01-01", _WED.isoformat())]
+        assert max(closes) / min(closes) < 1.01
+        assert store.rescaled_symbols(conn)["ELC"]["seam_date"] == join
+    n = len(src.calls)
+    assert adapter.rescan_rescale("ELC") is None, "repaired — the window now agrees"
+    assert len(src.calls) == n + 1, "one read to say so, no second repair"
+
+
+def test_rescan_repairs_again_when_an_earlier_repair_did_not_take(temp_db, monkeypatch):
+    """N5 (VPI): a repair that refetched before the source had adjusted re-banked the
+    old scale and still wrote the ledger. The store disagreeing with the source now
+    outranks that entry, at most once a day."""
+    _pin_today(monkeypatch, _WED)
+    join = (_WED - timedelta(days=5)).isoformat()
+    _bank("ELC", _seamed(_WED - timedelta(days=40), _WED - timedelta(days=1),
+                         scale=0.93, at=join),
+          board={"ceiling": 115.0, "floor": 85.0, "ref_price": 100.0})
+    src = _RangeSrc(_seamed(_WED - timedelta(days=60), _WED, scale=0.93, at="1900-01-01"))
+    vmd.set_sources([src])
+    with closing(vmd.connect()) as conn:
+        conn.execute("INSERT INTO md_ohlcv_seams(symbol, seam_date, band, repaired_at) "
+                     "VALUES ('ELC', ?, 0.15, '2000-01-01T02:02:00+00:00')", (join,))
+        conn.commit()
+
+    assert adapter.rescan_rescale("ELC") == join
+    with closing(vmd.connect()) as conn:
+        closes = [r["close"] for r in store.get_ohlcv_range(
+            conn, "ELC", "2000-01-01", _WED.isoformat())]
+        assert max(closes) / min(closes) < 1.01
+
+
+def test_rescan_repairs_a_seam_at_most_once_a_day(temp_db, monkeypatch):
+    """A source serving both scales must not buy a full refetch on every call."""
+    _pin_today(monkeypatch, _WED)
+    join = (_WED - timedelta(days=5)).isoformat()
+    _bank("ELC", _seamed(_WED - timedelta(days=40), _WED - timedelta(days=1),
+                         scale=0.93, at=join),
+          board={"ceiling": 115.0, "floor": 85.0, "ref_price": 100.0})
+    src = _RangeSrc(_seamed(_WED - timedelta(days=60), _WED, scale=0.93, at="1900-01-01"))
+    vmd.set_sources([src])
+    with closing(vmd.connect()) as conn:
+        store.mark_seams_repaired(conn, "ELC", [join], 0.15)       # stamped now
+
+    assert adapter.rescan_rescale("ELC") is None
+    assert len(src.calls) == 1, "the window read only, no repair refetch"
+
+
+def test_rescan_keeps_the_withheld_marker_of_its_own_refetch(temp_db, monkeypatch):
+    """A rescan's repair refetch reaches today too. If the feed is still serving today's
+    bar truncated, the store withholds it — and the fetch record must say so, or it
+    wipes a post-close catch-up's retry marker and the TTL serves yesterday till ~20:00."""
+    today = datetime.now(ICT).date()
+    _pin_today(monkeypatch, today)
+    join = (today - timedelta(days=5)).isoformat()
+    _bank("ELC", _seamed(today - timedelta(days=40), today - timedelta(days=1),
+                         scale=0.93, at=join),
+          board={"ceiling": 115.0, "floor": 85.0, "ref_price": 100.0})
+    rows = _seamed(today - timedelta(days=60), today, scale=0.93, at="1900-01-01")
+    rows[-1]["volume"] = 5                                   # today's bar, truncated
+    vmd.set_sources([_RangeSrc(rows)])
+
+    assert adapter.rescan_rescale("ELC") == join
+    with closing(vmd.connect()) as conn:
+        assert store.meta_fetched_at(conn, "ELC", "ohlcv")[1] == today.isoformat()
+        assert store.ohlcv_bounds(conn, "ELC")[1] < today.isoformat()
+
+
 def test_no_ledger_means_nothing_to_report(temp_db):
     """A store that has never repaired anything must answer empty, not scan."""
     _bank("QUIET", _rows_between(_WED - timedelta(days=10), _WED))
@@ -697,24 +1096,43 @@ def test_board_degrades_to_the_last_stored_snapshot(temp_db):
     assert adapter.get_board(["HPG"], ttl_s=0, stale_ttl_s=0) == {}
 
 
+def test_board_entries_carry_when_they_were_read(temp_db):
+    """A board answer can be the cached or stale snapshot, not a read made for this call,
+    so each entry says when it was read — and a cache hit reports the original read, not
+    the moment it was served (2026-09-18: a 12:56 VPB row banked as the session's flow
+    read positive while the live board at 13:27 read −21.5 bn, and nothing said which
+    moment either number described)."""
+    vmd.set_sources([_BoardSrc("live", board={"foreign_net_value": 1.0})])
+    first = adapter.get_board(["HPG"])["HPG"]["read_at"]
+    assert datetime.fromisoformat(first).tzinfo is not None
+
+    vmd.set_sources([_BoardSrc("down", raises=SourceUnavailable("ConnectionError"))])
+    assert adapter.get_board(["HPG"])["HPG"]["read_at"] == first            # cache hit
+    assert adapter.get_board(["HPG"], ttl_s=0)["HPG"]["read_at"] == first   # stale fallback
+
+
 # ── DA-U-08: the statement archive ───────────────────────────────────────────
 
 class _StmtSrc(DataSource):
     """A source with VCI's defining limitation: it answers with a fixed-width window
     of the most recent periods and nothing earlier, however often it is asked."""
 
-    def __init__(self, window, *, kind="general", name="fake"):
+    def __init__(self, window, *, kind="general", name="fake", labelled=True):
         self.name = name
         self.window = window          # {label: revenue}
+        self.labelled = labelled      # False = a payload cached before the relabel
         self.calls = 0
 
     def get_statements(self, symbol, period="year"):
         self.calls += 1
         labels = sorted(self.window, reverse=True)
-        return {"kind": "general", "periods": labels,
-                "statements": {"income": {"net_sales": dict(self.window)},
-                               "balance": {}, "cashflow": {}},
-                "ratio_extra": {"P/E": 1.0}}
+        out = {"kind": "general", "periods": labels,
+               "statements": {"income": {"net_sales": dict(self.window)},
+                              "balance": {}, "cashflow": {}},
+               "ratio_extra": {"NPL (%)": {"2018": 0.02, labels[0]: 0.01}}}
+        if self.labelled:
+            out["ratio_labels"] = RATIO_LABELS
+        return out
 
 
 def test_statement_archive_outgrows_the_fixed_source_window(temp_db):
@@ -758,15 +1176,77 @@ def test_statement_archive_prefers_the_restated_figure(temp_db):
 
 
 def test_statement_archive_carries_live_ratio_extra_but_banks_none_of_it(temp_db):
-    """ratio_extra is trailing-twelve-month, not a property of any labelled period, so
-    archiving it per period would date-stamp a figure that has no date."""
+    """ratio_extra arrives whole on every fetch — the source serves the full series back
+    to 2018 — so archiving it per period would bank nothing the next fetch lacks."""
     vmd.set_sources([_StmtSrc({"2025": 100})])
     adapter.get_statements("DPR", "year")
     with closing(vmd.connect()) as conn:
         banked = json.loads(conn.execute(
             "SELECT payload FROM md_statement_periods WHERE symbol='DPR'").fetchone()[0])
     assert set(banked) == {"income"} and "ratio_extra" not in banked
-    assert adapter.get_statement_history("DPR", "year", ttl_s=1e9)["ratio_extra"] == {"P/E": 1.0}
+    assert adapter.get_statement_history("DPR", "year", ttl_s=1e9)["ratio_extra"] == \
+        {"NPL (%)": {"2018": 0.02, "2025": 0.01}}
+
+
+def test_unlabelled_ratio_payload_reads_as_cannot_say(temp_db):
+    """A payload cached before the ratios were keyed by the source's own labels carries
+    2018 readings under this decade's labels. It must read as no ratios at all — on the
+    fresh path, the cached path and the archive path alike — never as a number."""
+    vmd.set_sources([_StmtSrc({"2025": 100}, labelled=False)])
+    assert adapter.get_statements("DPR", "year")["ratio_extra"] == {}
+    assert adapter.get_statements("DPR", "year")["ratio_extra"] == {}      # cached
+    assert adapter.get_statement_history("DPR", "year", ttl_s=1e9)["ratio_extra"] == {}
+    assert adapter.get_banked_statements("DPR", "year")["ratio_extra"] == {}
+    # The statements themselves are untouched.
+    assert adapter.get_statements("DPR", "year")["statements"]["income"]["net_sales"] == \
+        {"2025": 100}
+
+
+def test_labelled_ratios_needs_the_current_stamp():
+    series = {"CASA Ratio": {"2026-Q2": 0.13}}
+    assert adapter.labelled_ratios({"ratio_extra": series,
+                                    "ratio_labels": RATIO_LABELS}) == series
+    assert adapter.labelled_ratios({"ratio_extra": series}) == {}
+    assert adapter.labelled_ratios({"ratio_extra": series, "ratio_labels": "old"}) == {}
+    assert adapter.labelled_ratios({}) == {}
+
+
+def _vci_ratio_frame():
+    import pandas as pd
+    return pd.DataFrame([
+        # VCI's statistics-financial rows, oldest first, as the raw report returns them.
+        {"yearReport": 2018, "quarter": 1, "ratioType": "RATIO_TTM", "npl": 0.035,
+         "casaRatio": 0.11, "car": 0, "netInterestMargin": 0.09},
+        {"yearReport": 2018, "quarter": 5, "ratioType": "RATIO_YEAR", "npl": 0.035,
+         "casaRatio": 0.12, "car": 0.12, "netInterestMargin": 0.092},
+        {"yearReport": 2025, "quarter": 5, "ratioType": "RATIO_YEAR", "npl": 0.033,
+         "casaRatio": 0.1445, "car": 0.1435, "netInterestMargin": 0.0557},
+        {"yearReport": 2026, "quarter": 2, "ratioType": "RATIO_TTM", "npl": 0.0328,
+         "casaRatio": 0.1275, "car": 0, "netInterestMargin": 0.0524},
+        {"yearReport": 2026, "quarter": 3, "ratioType": "OTHER", "npl": 0.5,
+         "casaRatio": 0.5, "car": 0.5, "netInterestMargin": 0.5},
+    ])
+
+
+def test_vci_ratio_series_is_keyed_by_the_rows_own_period():
+    """The fault this replaced: vnstock's ratio() keeps the *oldest* four rows and the
+    old parse relabelled them with the newest periods, so every bank published 2018."""
+    pytest.importorskip("pandas")
+    from vn_market_data.sources.vci import VCISource
+    s = VCISource._ratio_series(_vci_ratio_frame())
+    assert s["NPL (%)"] == {"2018-Q1": 0.035, "2018": 0.035, "2025": 0.033,
+                            "2026-Q2": 0.0328}
+    assert s["Net Interest Margin"]["2026-Q2"] == 0.0524
+    assert s["CASA Ratio"]["2025"] == 0.1445
+    # VCI fills an unreported CAR with 0: absent, not zero.
+    assert s["CAR"] == {"2018": 0.12, "2025": 0.1435}
+    assert all("2026-Q3" not in v for v in s.values())      # unknown ratioType skipped
+
+
+def test_vci_ratio_series_degrades_to_empty():
+    from vn_market_data.sources.vci import VCISource
+    assert VCISource._ratio_series(None) == {}
+    assert VCISource._ratio_series(object()) == {}
 
 
 def test_no_statements_banks_nothing(temp_db):
@@ -871,14 +1351,16 @@ def test_upsert_banks_a_normal_bar_for_today(temp_db):
     assert _banked("HPG")[date.today().isoformat()] == 800_000
 
 
-def test_upsert_banks_a_thin_settled_session(temp_db):
+def test_upsert_banks_a_thin_settled_session_and_reports_it(temp_db):
     """Low volume alone proves nothing: 0.8% of real settled bars in the live store sit
-    below the threshold, and those are true. Only *today* is ever withheld."""
+    below the threshold, and those are true. So a settled bar is never withheld — it is
+    banked, and handed back for a second source to rule on."""
     thin = _settled_rows(1, volume=9_000, end_offset=1)     # yesterday, 0.9% of median
     rows = _settled_rows(20, end_offset=2) + thin
     with closing(vmd.connect()) as conn:
-        store.upsert_ohlcv(conn, "SCR", rows, "fake")
-    assert _banked("SCR")[thin[0]["date"]] == 9_000
+        suspect = store.upsert_ohlcv(conn, "SCR", rows, "fake")
+    assert _banked("SCR")[thin[0]["date"]] == 9_000, "a hole is worse than a thin bar"
+    assert suspect == [thin[0]["date"]]
 
 
 def test_upsert_banks_todays_bar_when_there_is_no_baseline(temp_db):
@@ -908,3 +1390,343 @@ def test_a_cold_backfill_measures_against_its_own_rows(temp_db):
     served = adapter.get_ohlcv("LPB", lookback_days=60)
     assert date.today().isoformat() not in {r["date"] for r in served}
     assert len(served) == 30
+
+
+# ── DA-U-05: a settled fragment is adjudicated against a second source ───────
+# The 2026-08-28 feed never revised the bar it truncated: three days on it still served
+# SHB at 8.2M against the 77.7M really traded. So withholding today's bar only defers a
+# fragment — the date stops being today and it banks anyway. A settled bar this thin has
+# to be ruled on by a second reading, and the ruling has to hold against the source that
+# got it wrong.
+
+def _yesterday():
+    return (date.today() - timedelta(days=1)).isoformat()
+
+
+def _fragment_history(fragment_volume=9_000, real_volume=1_600_000):
+    """20 normal sessions, then yesterday served two ways: a fragment and the real bar."""
+    history = _settled_rows(20, end_offset=2)
+    def bar(volume, close):
+        return {"date": _yesterday(), "open": 100.0, "high": 100.5, "low": 99.5,
+                "close": close, "volume": float(volume)}
+    return history, bar(fragment_volume, 100.0), bar(real_volume, 103.0)
+
+
+def _ruling(symbol, day):
+    with closing(vmd.connect()) as conn:
+        row = conn.execute("SELECT * FROM md_ohlcv_stubs WHERE symbol=? AND date=?",
+                           (symbol, day)).fetchone()
+    return dict(row) if row else None
+
+
+def test_a_settled_fragment_is_re_banked_from_the_second_source(temp_db):
+    """The primary's fragment is banked (a hole would be worse), then overwritten by the
+    source that has the real session — close and all, not just the volume."""
+    history, fragment, real = _fragment_history()
+    primary = _Src("primary", ohlcv=history + [fragment])
+    backup = _Src("backup", ohlcv=[real])
+    vmd.set_sources([primary, backup])
+
+    adapter.get_ohlcv("SHB", lookback_days=60)
+
+    with closing(vmd.connect()) as conn:
+        banked = conn.execute("SELECT volume, close, source FROM md_ohlcv "
+                              "WHERE symbol='SHB' AND date=?", (_yesterday(),)).fetchone()
+    assert banked["volume"] == 1_600_000 and banked["close"] == 103.0
+    assert banked["source"] == "backup", "provenance follows the reading that was kept"
+    assert _ruling("SHB", _yesterday())["verdict"] == "fragment"
+
+
+def test_the_source_that_served_a_fragment_is_refused_that_date(temp_db):
+    """The whole point of recording the ruling. The primary keeps serving its fragment
+    on every 4-hourly top-up; without the refusal each one overwrites the repair."""
+    history, fragment, real = _fragment_history()
+    vmd.set_sources([_Src("primary", ohlcv=history + [fragment]),
+                     _Src("backup", ohlcv=[real])])
+    adapter.get_ohlcv("SHB", lookback_days=60)
+
+    with closing(vmd.connect()) as conn:
+        store.upsert_ohlcv(conn, "SHB", [fragment], "primary")
+        assert _banked("SHB")[_yesterday()] == 1_600_000, "the repair must survive"
+        # Only that source, and only that date: anyone else may still write it.
+        store.upsert_ohlcv(conn, "SHB", [dict(fragment, volume=1_700_000.0)], "backup")
+    assert _banked("SHB")[_yesterday()] == 1_700_000
+
+
+def test_a_thin_day_the_second_source_confirms_is_kept_and_not_re_asked(temp_db):
+    """Two feeds agreeing on a thin session means the session was thin. The bar stands,
+    and the ruling is banked so the same quiet symbol is not re-checked every TTL."""
+    history, fragment, _ = _fragment_history()
+    backup = _Src("backup", ohlcv=[dict(fragment)])
+    vmd.set_sources([_Src("primary", ohlcv=history + [fragment]), backup])
+
+    adapter.get_ohlcv("SCR", lookback_days=60)
+    assert _banked("SCR")[_yesterday()] == 9_000
+    assert _ruling("SCR", _yesterday())["verdict"] == "true"
+
+    asked = backup.calls
+    with closing(vmd.connect()) as conn:
+        assert store.upsert_ohlcv(conn, "SCR", [fragment], "primary") == [], \
+            "a date already ruled on is never offered again"
+    assert backup.calls == asked
+
+
+def test_an_old_thin_bar_is_never_adjudicated(temp_db):
+    """A backfill spans years and 0.8% of its bars are legitimately this thin. Paying a
+    metered call for each would cost more than the backfill. Old history belongs to the
+    seam detector, not to this check."""
+    old_thin = _settled_rows(1, volume=9_000, end_offset=40)
+    rows = _settled_rows(20, end_offset=41) + old_thin
+    backup = _Src("backup", ohlcv=[])
+    vmd.set_sources([_Src("primary", ohlcv=rows), backup])
+
+    adapter.get_ohlcv("DPM", lookback_days=200)
+    assert _banked("DPM")[old_thin[0]["date"]] == 9_000
+    assert backup.calls == 0 and _ruling("DPM", old_thin[0]["date"]) is None
+
+
+def test_a_rescale_drops_the_rulings_it_would_strand(temp_db):
+    """A refusal is a statement about one bar on one scale. After a corporate action the
+    whole series is refetched on a new one, and keeping the refusal would hold that date
+    back on the old scale — a seam of our own making."""
+    history, fragment, real = _fragment_history()
+    vmd.set_sources([_Src("primary", ohlcv=history + [fragment]),
+                     _Src("backup", ohlcv=[real])])
+    adapter.get_ohlcv("VIX", lookback_days=60)
+
+    with closing(vmd.connect()) as conn:
+        store.clear_stub_checks(conn, "VIX")
+        assert store.fragment_dates(conn, "VIX") == {}
+        store.upsert_ohlcv(conn, "VIX", [fragment], "primary")
+    assert _banked("VIX")[_yesterday()] == 9_000, "re-adjudicated, not refused outright"
+
+
+# ── DA-U-09: the source-call recorder ────────────────────────────────────────
+
+class _QuotaSrc(DataSource):
+    """Statements from a source with a quota: it answers `budget` requests, then trips."""
+
+    def __init__(self, budget, *, name="vci"):
+        self.name = name
+        self.budget = budget
+
+    def get_statements(self, symbol, period="year"):
+        if self.budget <= 0:
+            raise SourceUnavailable("quota")
+        self.budget -= 1
+        return {"kind": "general", "periods": ["2025"],
+                "statements": {"income": {"net_sales": {"2025": 1}},
+                               "balance": {}, "cashflow": {}}, "ratio_extra": {}}
+
+
+def test_recorder_counts_requests_not_reads(temp_db):
+    """The point of it: the store answers a repeat read, and that read costs the source
+    nothing, so it must not be on the bill."""
+    vmd.set_sources([_QuotaSrc(10)])
+    with vmd.record_source_calls() as calls:
+        adapter.get_statements("HPG", "year")
+        adapter.get_statements("HPG", "year")          # cache hit — no request
+        adapter.get_statements("VNM", "year")
+    assert calls == [vmd.SourceCall("vci", "get_statements", "ok", "HPG"),
+                     vmd.SourceCall("vci", "get_statements", "ok", "VNM")]
+
+
+def test_recorder_marks_where_the_quota_tripped(temp_db):
+    """A trip is on the record as the request it happened on, not inferred from a pass
+    that came up short."""
+    vmd.set_sources([_QuotaSrc(2)])
+    with vmd.record_source_calls() as calls:
+        for s in ("AAA", "BBB", "CCC"):
+            try:
+                adapter.get_statements(s, "year")
+            except SourceUnavailable:
+                break
+    assert [(c.symbol, c.outcome) for c in calls] == [
+        ("AAA", "ok"), ("BBB", "ok"), ("CCC", "unavailable")]
+
+
+def test_recorder_sees_each_source_the_chain_tried(temp_db):
+    """A fallthrough is two requests to two sources — the head one spent its quota too."""
+    vmd.set_sources([_QuotaSrc(0, name="head"), _QuotaSrc(5, name="tail")])
+    with vmd.record_source_calls() as calls:
+        adapter.get_statements("HPG", "year")
+    assert [(c.source, c.outcome) for c in calls] == [("head", "unavailable"),
+                                                      ("tail", "ok")]
+
+
+def test_recorder_ignores_not_supported_and_records_nothing_when_closed(restore_sources):
+    """A capability refusal is decided before any request; and with no recorder open the
+    hot path must not accumulate anything."""
+    vmd.set_sources([_Src("a", raises=NotSupported("get_ohlcv")), _Src("b", ohlcv=[])])
+    adapter._query("get_ohlcv", "HPG", "s", "e")      # no recorder: nowhere to go
+    with vmd.record_source_calls() as calls:
+        adapter._query("get_ohlcv", "HPG", "s", "e")
+    assert [(c.source, c.outcome) for c in calls] == [("b", "ok")]
+
+
+def test_recorders_nest_and_the_outer_keeps_the_total(restore_sources):
+    vmd.set_sources([_Src("a", ohlcv=[])])
+    with vmd.record_source_calls() as outer:
+        adapter._query("get_ohlcv", "AAA", "s", "e")
+        with vmd.record_source_calls() as inner:
+            adapter._query("get_ohlcv", "BBB", "s", "e")
+    assert [c.symbol for c in inner] == ["BBB"]
+    assert [c.symbol for c in outer] == ["AAA", "BBB"]
+
+
+def test_recorder_follows_the_call_into_a_worker_thread(restore_sources):
+    """The host runs this blocking layer under `asyncio.to_thread`; a recorder opened in
+    the coroutine has to see the worker's requests or it undercounts every real pass."""
+    import asyncio
+    vmd.set_sources([_Src("a", ohlcv=[])])
+
+    async def _pass():
+        with vmd.record_source_calls() as calls:
+            await asyncio.gather(*(asyncio.to_thread(adapter._query, "get_ohlcv", s, "s", "e")
+                                   for s in ("AAA", "BBB")))
+        return calls
+
+    assert sorted(c.symbol for c in asyncio.run(_pass())) == ["AAA", "BBB"]
+
+
+# ── announced-but-undated events, through the store ──────────────────────────
+
+def test_store_derives_status_and_keeps_an_undated_row(temp_db):
+    """A cached announcement survives the round trip and comes back labelled.
+
+    `status` is derived on read rather than stored, for two reasons. A column would be
+    free to disagree with the column it describes — `status="confirmed"` beside an empty
+    `ex_date` is a state nothing could act on. And deriving it hands the label to rows
+    banked before the field existed and to any source that never emits one, which is
+    what SM's card and import job read to decide whether an event has a calendar
+    position at all.
+    """
+    from vn_market_data import store
+
+    with vmd.connect() as conn:
+        store.replace_events(conn, "DRI", [
+            {"type": "CASH", "ex_date": "2026-09-22", "record_date": "2026-09-23",
+             "pay_date": "2026-10-15", "announced_date": "2026-08-01",
+             "value_per_share": 1000.0, "ratio": 0.0, "title": "dated",
+             "event_code": "DIV"},
+            {"type": "STOCK", "ex_date": "", "record_date": "", "pay_date": "",
+             "announced_date": "2026-09-11", "value_per_share": 0.0, "ratio": 0.2,
+             "title": "announced", "event_code": "ISS"},
+        ], "fake")
+        rows = store.get_events(conn, "DRI")
+
+    # Undated first: `ORDER BY ex_date` sorts "" ahead of every real date, which is the
+    # order a reader wants anyway — an announcement needs a lookup, a date does not.
+    assert [r["status"] for r in rows] == ["announced", "confirmed"]
+    assert rows[0]["ex_date"] == "" and rows[0]["announced_date"] == "2026-09-11"
+    assert rows[1]["ex_date"] == "2026-09-22"
+
+
+def test_store_reports_a_missing_announcement_date_as_empty_not_null(temp_db):
+    """Rows banked before `announced_date` existed read `""`, like every other absent
+    date in this shape. A None would reach the frontend as `null` and compare against
+    an ISO window without raising — `null >= "2026-08-17"` is just false in JS, so the
+    row would vanish silently rather than be recognised as unaged."""
+    from vn_market_data import store
+
+    with vmd.connect() as conn:
+        store.replace_events(conn, "SHB", [
+            {"type": "STOCK", "ex_date": "", "ratio": 0.1, "title": "no date at all",
+             "event_code": "ISS"}], "fake")
+        [row] = store.get_events(conn, "SHB")
+    assert row["announced_date"] == "" and row["status"] == "announced"
+
+
+# ── Board depth + VWAP (todo 42, display only) ───────────────────────────────
+
+def _serve_board(monkeypatch, frame):
+    import sys, types
+
+    class _Trading:
+        def __init__(self, source):
+            pass
+
+        def price_board(self, symbols):
+            return frame
+
+    mod = types.ModuleType("vnstock")
+    mod.Trading = _Trading
+    monkeypatch.setitem(sys.modules, "vnstock", mod)
+
+
+def test_vci_board_reads_vwap_and_three_levels_per_side(monkeypatch):
+    """Shapes measured on the live board 2026-09-24: HOSE sends three levels, HNX/UPCOM
+    ten (cut to three so depth means one thing everywhere); an empty level is NaN and
+    ends the side; `avg_match_price` is the session VWAP in full VND, 0 before any match."""
+    pd = pytest.importorskip("pandas")
+    from vn_market_data.sources.vci import VCISource
+
+    nan = float("nan")
+    cols = pd.MultiIndex.from_tuples(
+        [("listing", "symbol"), ("match", "match_price"), ("match", "avg_match_price")]
+        + [("bid_ask", f"{side}_{i}_{f}") for side in ("bid", "ask")
+           for i in range(1, 5) for f in ("price", "volume")])
+    rows = [
+        # HNX-like: four levels served, three kept
+        ["PVS", 33000, 33086.87,
+         32900, 17100, 32800, 79300, 32700, 57900, 32600, 66500,
+         33000, 7300, 33100, 20800, 33200, 35400, 33300, 32400],
+        # Limit-up lock: no asks at all; bids stop at a hole; no match yet → no VWAP
+        ["XYZ", 0, 0,
+         10700, 500000, nan, nan, 10600, 900, nan, nan,
+         nan, nan, nan, nan, nan, nan, nan, nan],
+    ]
+    _serve_board(monkeypatch, pd.DataFrame(rows, columns=cols))
+    board = VCISource().get_board(["PVS", "XYZ"])
+
+    assert board["PVS"]["vwap"] == 33086.87
+    assert board["PVS"]["bids"] == [[32900, 17100], [32800, 79300], [32700, 57900]]
+    assert board["PVS"]["asks"] == [[33000, 7300], [33100, 20800], [33200, 35400]]
+    assert board["XYZ"]["vwap"] is None
+    assert board["XYZ"]["bids"] == [[10700, 500000]]     # nothing past the hole
+    assert board["XYZ"]["asks"] == []                    # empty side, not "not read"
+
+
+def test_an_auction_price_as_text_reads_as_not_read_not_as_empty(monkeypatch):
+    """During ATO/ATC a level-1 price can be the text "ATO"/"ATC". That side is
+    unreadable, not empty: `[]` is what a limit lock looks like, and the close's
+    snapshot banked from it would carry a book with no orders on one side."""
+    pd = pytest.importorskip("pandas")
+    from vn_market_data.sources.vci import VCISource
+
+    cols = pd.MultiIndex.from_tuples(
+        [("listing", "symbol"), ("match", "match_price"), ("match", "avg_match_price")]
+        + [("bid_ask", f"{side}_{i}_{f}") for side in ("bid", "ask")
+           for i in range(1, 4) for f in ("price", "volume")])
+    rows = [["MBB", 19950, 19946.0,
+             "ATC", 120000, 19900, 665900, 19850, 978400,
+             19950, 298800, 20000, 431900, 20050, 140800]]
+    _serve_board(monkeypatch, pd.DataFrame(rows, columns=cols, dtype=object))
+    board = VCISource().get_board(["MBB"])
+
+    assert board["MBB"]["bids"] is None
+    assert board["MBB"]["asks"] == [[19950, 298800], [20000, 431900], [20050, 140800]]
+
+
+def test_board_depth_round_trips_through_the_store(temp_db):
+    vmd.set_sources([_BoardSrc("live", board={
+        "close": 20000.0, "vwap": 19950.0,
+        "bids": [[19950.0, 1000.0]], "asks": [[20000.0, 500.0], [20050.0, 200.0]]})])
+    adapter.get_board(["MBB"])
+    vmd.set_sources([_BoardSrc("down", raises=SourceUnavailable("ConnectionError"))])
+    got = adapter.get_board(["MBB"])["MBB"]                     # cache hit, from the store
+    assert got["vwap"] == 19950.0
+    assert got["bids"] == [[19950.0, 1000.0]]
+    assert got["asks"] == [[20000.0, 500.0], [20050.0, 200.0]]
+
+    newest = vmd.newest_board("mbb")                             # any age, no source call
+    assert newest["read_at"] == got["read_at"] and newest["vwap"] == 19950.0
+    assert vmd.newest_board("NONE") is None
+
+
+def test_a_board_without_depth_reads_as_not_read(temp_db):
+    """A row banked before depth was kept (or by a source with none) must not come
+    back as an empty book — `[]` means no resting orders, None means nobody looked."""
+    vmd.set_sources([_BoardSrc("live", board={"close": 20000.0})])
+    got = adapter.get_board(["MBB"])["MBB"]
+    assert got["bids"] is None and got["asks"] is None and got["vwap"] is None
